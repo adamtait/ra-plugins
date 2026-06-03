@@ -76,7 +76,7 @@ description: "What this plugin does"
 
 config:
   - name: enabled         # include in every plugin
-    type: bool            # bool | string | int
+    type: bool            # bool | string | string_list | int
     description: "Enable my plugin?"
     default: false
   - name: my_setting
@@ -109,6 +109,12 @@ auth_providers:            # omit if no auth choice is needed
 ```
 
 `ra plugin install` prompts for each `config` field, the chosen `auth_provider` (if any), and secret values (hidden input). If a field or secret declares `value_command`, `ra` runs that local command and uses its output instead of prompting. Config is written to `config.yaml`; secret values go to GCP Secret Manager.
+
+**Additional top-level fields:**
+
+`port-for-tunnel: <port>` — exposes a workstation port as a tunnel endpoint (e.g. a web server). Used by the `marimo` plugin.
+
+`buckets:` — declares a GCS bucket that `ra` provisions at install time and makes available at runtime via env var. Used by the `claude-sync` plugin. Fields: `name`, `name_template`, `override_field`, `role`, `env_var`.
 
 ### Runtime environment contract
 
