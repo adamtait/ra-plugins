@@ -65,7 +65,7 @@ Filenames follow `<NNN>_<plugin-name>-<purpose>.sh`. Numbers control execution o
 
 - **`Dockerfile.d/`** — use `100`–`199`
 - **`workstation-startup.d/`** — use `250`+. The core `200_remote-agent-setup.sh` runs first; plugin scripts must be ≥ 250 to guarantee secrets are available.
-- **`profile.d/`** — use `10`+ for plugin additions (`00`–`09` is reserved for the core `00-ra-wait.sh`).
+- **`profile.d/`** — no strict convention; existing plugins use `00`–`50`. Lower numbers run first.
 
 ### plugin.yaml schema
 
@@ -76,7 +76,7 @@ description: "What this plugin does"
 
 config:
   - name: enabled         # include in every plugin
-    type: bool            # bool | string | int
+    type: bool            # bool | string | string_list | int
     description: "Enable my plugin?"
     default: false
   - name: my_setting
@@ -109,6 +109,12 @@ auth_providers:            # omit if no auth choice is needed
 ```
 
 `ra plugin install` prompts for each `config` field, the chosen `auth_provider` (if any), and secret values (hidden input). If a field or secret declares `value_command`, `ra` runs that local command and uses its output instead of prompting. Config is written to `config.yaml`; secret values go to GCP Secret Manager.
+
+**Additional top-level fields:**
+
+`port-for-tunnel: <port>` — exposes a workstation port as a tunnel endpoint (e.g. a web server). Used by the `marimo` plugin.
+
+`buckets:` — declares a GCS bucket that `ra` provisions at install time and makes available at runtime via env var. Used by the `claude-sync` plugin. Fields: `name`, `name_template`, `override_field`, `role`, `env_var`.
 
 ### Runtime environment contract
 

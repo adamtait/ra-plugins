@@ -49,6 +49,27 @@ Notes on decisions, tradeoffs, and changes made during the open-source preparati
 
 ---
 
+## Post-review fixes (from /code-review)
+
+Four issues were found by the code review and fixed:
+
+### 1. README profile.d numbering was wrong
+README claimed "use `10`+ for plugin additions (`00`–`09` is reserved for core `00-ra-wait.sh`)." But the actual plugins use `00` (claude, codex), `01` (github), and `05` (tmux) — all in the supposedly reserved range. Fixed to say "no strict convention; existing plugins use `00`–`50`. Lower numbers run first."
+
+### 2. README schema missing `string_list` type
+The `type` comment in the plugin.yaml schema listed `bool | string | int` but omitted `string_list`, which the `github` plugin uses for `repo_urls`. Added.
+
+### 3. .gitignore missing Terraform state artifacts
+Added `.terraform/`, `*.tfstate`, `*.tfstate.backup`. These files can contain cloud credentials and infrastructure state — committing them from a terraform-plugin development environment would be a security incident.
+
+### 4. README schema missing `buckets:` and `port-for-tunnel` fields
+The schema example didn't document two top-level plugin.yaml fields used by existing plugins:
+- `port-for-tunnel` (marimo)
+- `buckets:` (claude-sync)
+Added a brief "Additional top-level fields" section after the schema block.
+
+---
+
 ## feature/add-readme branch cleanup
 
 **Recommendation:** After this PR merges, delete the `feature/add-readme` branch — its content is now fully incorporated here. The branch serves no further purpose and would be confusing alongside an open-source history.

@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 *.pyo
 node_modules/
+.terraform/
+*.tfstate
+*.tfstate.backup
