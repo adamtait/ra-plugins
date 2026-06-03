@@ -65,7 +65,7 @@ Filenames follow `<NNN>_<plugin-name>-<purpose>.sh`. Numbers control execution o
 
 - **`Dockerfile.d/`** — use `100`–`199`
 - **`workstation-startup.d/`** — use `250`+. The core `200_remote-agent-setup.sh` runs first; plugin scripts must be ≥ 250 to guarantee secrets are available.
-- **`profile.d/`** — use `10`+ for plugin additions (`00`–`09` is reserved for the core `00-ra-wait.sh`).
+- **`profile.d/`** — no strict convention; existing plugins use `00`–`50`. Lower numbers run first.
 
 ### plugin.yaml schema
 
