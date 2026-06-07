@@ -45,19 +45,28 @@ cat > "${LOOP_PATH}" <<'LOOP_EOF'
 # seconds. All data lives under the claude-sync/ prefix so other plugins
 # can share the same bucket without collisions.
 #
+# Push integrity (see SPEC.md "ADR 2026-06-07"):
+#   * history.jsonl is sanitized (torn/invalid lines dropped) before
+#     upload so a line caught mid-append never ships.
+#   * .claude.json is JSON-validated before upload; a torn read is
+#     skipped for the cycle.
+#   * the manifest is advanced ONLY when every push in the cycle
+#     succeeded, so a partial/failed push never advertises itself as
+#     "freshest".
+#
 # All gcloud chatter is appended to /var/log/ra-claude-sync.log so a
 # silent regression in steady state is auditable. Exits with status 1
 # on any unrecoverable startup error (env never appears, plugin
 # disabled at startup). Under systemd the Restart=always policy retries;
 # under the setsid fallback the loop simply dies until the next
-# workstation reboot re-runs 271_*.sh — acceptable because the parent
-# script (271_*.sh) re-validates the same preconditions before launching
-# us, so a fatal startup exit here would just repeat on every retry.
+# workstation reboot re-runs 271_*.sh.
 set -uo pipefail
 
 USER_HOME="/home/user"
 LOG_FILE="/var/log/ra-claude-sync.log"
 PID_FILE="/run/ra-claude-sync.pid"
+# Last-known-good workstation id, cached on the persistent home disk.
+WS_ID_CACHE="${USER_HOME}/.ra-claude-sync/ws-id"
 
 mkdir -p "$(dirname "${LOG_FILE}")" "$(dirname "${PID_FILE}")"
 exec >> "${LOG_FILE}" 2>&1
@@ -70,6 +79,38 @@ echo $$ > "${PID_FILE}"
 trap 'rm -f "${PID_FILE}"' EXIT
 
 log() { echo "[claude-sync-loop] $(date -u +%H:%M:%S) $*"; }
+
+# Resolve this workstation's stable id. Metadata is authoritative; we
+# cache the last-known-good value and prefer it over the `hostname`
+# fallback so a momentary metadata outage cannot fork our namespace.
+# MUST stay in sync with the identical function in 270_claude-sync-pull.sh.
+resolve_ws_id() {
+    local id="" i
+    for i in 1 2 3; do
+        id="$(curl -fs -H 'Metadata-Flavor: Google' \
+            'http://metadata.google.internal/computeMetadata/v1/instance/name' \
+            2>>"${LOG_FILE}" || true)"
+        [ -n "${id}" ] && break
+        id=""
+        sleep 1
+    done
+    if [ -n "${id}" ]; then
+        mkdir -p "$(dirname "${WS_ID_CACHE}")" 2>/dev/null || true
+        printf '%s\n' "${id}" > "${WS_ID_CACHE}" 2>/dev/null || true
+        printf '%s' "${id}"
+        return 0
+    fi
+    if [ -r "${WS_ID_CACHE}" ]; then
+        local cached
+        cached="$(head -n1 "${WS_ID_CACHE}" 2>/dev/null || true)"
+        if [ -n "${cached}" ]; then
+            printf '%s' "${cached}"
+            return 0
+        fi
+    fi
+    printf '%s' "$(hostname)"
+    return 1
+}
 
 # Wait up to 5 minutes for /run/ra/env to be populated. On a fresh
 # workstation boot, this systemd unit may start before the core
@@ -104,41 +145,73 @@ BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
 INTERVAL="${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60}"
 case "${INTERVAL}" in *[!0-9]*|"") INTERVAL=60 ;; esac
 
-WS_ID="$(curl -fs -H 'Metadata-Flavor: Google' \
-    'http://metadata.google.internal/computeMetadata/v1/instance/name' 2>>"${LOG_FILE}" \
-    || true)"
-[ -n "${WS_ID}" ] || WS_ID="$(hostname)"
+# Metadata is up by now (we waited for /run/ra/env, well after boot), so
+# this resolves authoritatively and caches the value for future boots.
+WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
 
 PREFIX="gs://${BUCKET}/claude-sync/workstations/${WS_ID}"
 MANIFEST_PATH="gs://${BUCKET}/claude-sync/_manifest/${WS_ID}.json"
 
 log "starting push loop ws-id=${WS_ID} interval=${INTERVAL}s prefix=${PREFIX}"
 
+# Upload history.jsonl with torn/invalid lines stripped. Returns non-zero
+# only if the upload itself failed (so the caller can withhold the
+# manifest); a file that is absent or has no valid lines is a no-op success.
+push_history() {
+    local src="${USER_HOME}/.claude/history.jsonl" tmp
+    [ -f "${src}" ] || return 0
+    tmp="$(mktemp)"
+    jq -R -c 'fromjson? // empty' "${src}" > "${tmp}" 2>>"${LOG_FILE}" || true
+    if [ -s "${tmp}" ]; then
+        if ! gcloud storage cp "${tmp}" "${PREFIX}/history.jsonl"; then
+            rm -f "${tmp}"; return 1
+        fi
+    else
+        log "history.jsonl had no valid lines this cycle; skipping its push"
+    fi
+    rm -f "${tmp}"
+    return 0
+}
+
+# Upload .claude.json only if it is currently valid JSON (a mid-write read
+# is skipped). A skipped invalid read is not a push failure.
+push_claude_json() {
+    local src="${USER_HOME}/.claude.json"
+    [ -f "${src}" ] || return 0
+    if jq -e . "${src}" >/dev/null 2>&1; then
+        gcloud storage cp "${src}" "${PREFIX}/claude.json" || return 1
+    else
+        log ".claude.json not valid JSON this cycle; skipping its push"
+    fi
+    return 0
+}
+
 push_once() {
+    local ok=1 sub
     for sub in projects todos plans session-env; do
         if [ -d "${USER_HOME}/.claude/${sub}" ]; then
             gcloud storage rsync --recursive \
-                "${USER_HOME}/.claude/${sub}/" "${PREFIX}/${sub}/" || true
+                "${USER_HOME}/.claude/${sub}/" "${PREFIX}/${sub}/" || ok=0
         fi
     done
-    if [ -f "${USER_HOME}/.claude/history.jsonl" ]; then
-        gcloud storage cp "${USER_HOME}/.claude/history.jsonl" \
-            "${PREFIX}/history.jsonl" || true
-    fi
-    if [ -f "${USER_HOME}/.claude.json" ]; then
-        gcloud storage cp "${USER_HOME}/.claude.json" \
-            "${PREFIX}/claude.json" || true
-    fi
+    push_history    || ok=0
+    push_claude_json || ok=0
 
-    # Manifest carries last_push_at so the boot pull script can pick a
-    # single namespace for last-writer-wins files.
-    local ts iso tmp
-    ts=$(date -u +%s)
-    iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-    tmp=$(mktemp)
-    printf '{"last_push_at": "%s", "last_push_at_epoch": %s}\n' "${iso}" "${ts}" > "${tmp}"
-    gcloud storage cp "${tmp}" "${MANIFEST_PATH}" || true
-    rm -f "${tmp}"
+    # Manifest carries last_push_at so operators (and a future v2
+    # incremental pull) can see when each namespace last fully synced.
+    # Advance it ONLY on a fully-successful cycle so it never points at a
+    # namespace whose data upload failed.
+    if [ "${ok}" -eq 1 ]; then
+        local ts iso tmp
+        ts=$(date -u +%s)
+        iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        tmp=$(mktemp)
+        printf '{"last_push_at": "%s", "last_push_at_epoch": %s}\n' "${iso}" "${ts}" > "${tmp}"
+        gcloud storage cp "${tmp}" "${MANIFEST_PATH}" || log "manifest upload failed"
+        rm -f "${tmp}"
+    else
+        log "push cycle incomplete; not advancing manifest"
+    fi
 }
 
 while true; do
