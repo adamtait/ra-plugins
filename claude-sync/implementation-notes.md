@@ -14,6 +14,145 @@ Format per entry:
 
 ---
 
+## 2026-06-07 — Fix: session loss from whole-file overwrite of history.jsonl
+
+### What was broken
+
+An incident review (a session present "earlier today" had vanished from
+`~/.claude/history.jsonl`) traced to a design flaw, not a code typo:
+`history.jsonl` is an **append-only union log** — one line per session
+prompt, keyed by `sessionId` — but the sync treated it as an opaque
+single file under last-writer-wins. Each workstation only ever appends
+the sessions *it* ran, so every namespace in GCS holds a **divergent
+partial copy**. Measured live on the production bucket
+(`remote-agent-sync-artifacts`): 25 namespaces with `history.jsonl` line
+counts ranging 46–127, union = 148 unique entries, and the local file
+was missing **21** entries that existed in the bucket.
+
+The boot pull (`270`) picked the namespace with the newest `_manifest`
+timestamp (excluding self) and ran `gcloud storage cp .../history.jsonl
+→ local`, **overwriting** local with that one partial copy. Every entry
+the "winner" lacked was destroyed. `.claude.json` was overwritten the
+same way. Three contributing bugs amplified it (all fixed here):
+
+1. **Manifest advanced on failure.** Every `gcloud cp` in `push_once`
+   had `|| true`, then the manifest was written unconditionally — so a
+   namespace whose data upload failed still advertised itself as
+   "freshest," and the pull would then trust its stale/missing data.
+2. **Unstable `WS_ID`.** `metadata || hostname`. On the live box these
+   differ (`workstations-a8d6b2c4-…` vs `personal`); a single metadata
+   blip forks one workstation's history into a second namespace, which
+   last-writer-wins then drops.
+3. **Torn reads.** A claude append concurrent with the streaming rsync
+   read could ship a torn last line, which then propagated.
+
+### Decisions
+
+**history.jsonl → union-merge on pull, sanitize on push.** Pull now
+stages *every* namespace's copy and merges local + all via
+`jq -R 'fromjson? // empty'` (drops torn lines) → dedup by
+`(timestamp, sessionId, display, project)` → `sort_by(.timestamp)`.
+Push filters through `fromjson? // empty` before upload. Verified
+against the real divergent bucket data: 137 staged-union + 1 local-only
+→ 138 merged, torn line dropped, deduped, sorted, idempotent.
+
+**.claude.json → local base + per-project history union** (user-chosen
+among three options; the other two were "stop syncing it" and "leave
+LWW"). The local file stays authoritative for every non-history field
+(this fixes a *latent* second bug: the old whole-file overwrite could
+import another machine's `oauthAccount`/onboarding state). Only
+`projects[path].history` arrays are folded in, order-preserving dedup.
+
+  - **Deviation from a naive merge:** I only touch projects where the
+    remote actually has a non-empty `history` array, so the merge never
+    creates empty `{"history":[]}` stub project entries. Discovered while
+    testing against real data: in the current Claude Code version these
+    namespaces' `projects[].history` arrays are empty/absent, so without
+    this guard the merge would have littered `.claude.json` with empty
+    project stubs. (Net effect today: the `.claude.json` history merge is
+    usually a no-op; its load-bearing value is *not clobbering local
+    config*.)
+
+**Manifest honesty (bug 1).** `push_once` tracks an `ok` flag across all
+gcloud ops and advances the manifest only when every op succeeded. A
+*skipped* push (e.g. `.claude.json` invalid this cycle) is intentionally
+**not** counted as a failure — otherwise a transient torn read would
+freeze the manifest forever. Since the union merge removed the pull's
+dependence on the manifest, this is now defense-in-depth + observability
+rather than load-bearing.
+
+**Stable `WS_ID` (bug 2).** Single `resolve_ws_id`: metadata (3 retries,
+authoritative) → last-known-good cache at
+`/home/user/.ra-claude-sync/ws-id` → `hostname` only if both fail.
+Crucially, **hostname results are never cached** (only authoritative
+metadata is), so once metadata recovers the real id is restored. Tested
+all four orderings.
+
+### Tradeoffs / things to know
+
+- **`resolve_ws_id` is duplicated** verbatim in `270` and the loop
+  heredoc in `271`, rather than factored into a sourced lib. Reason:
+  `270` runs before `271` in boot order, so it cannot depend on a file
+  `271` writes, and the scaffold (`buildcontext.go`) only walks
+  `Dockerfile.d/`, `workstation-startup.d/`, `profile.d/` — there is no
+  place to drop a shared lib that both pick up without ordering games.
+  The pre-existing code already duplicated the inline metadata curl, so
+  this continues that pattern. A header comment on both copies says
+  "keep in sync." If they drift, the two scripts could resolve different
+  ids — low risk since the logic is small and stable.
+
+- **Cache lives on the home disk** (`/home/user/.ra-claude-sync/`), not
+  `/var/lib`. Cloud Workstations only persist `/home` across stop/start;
+  `/var` is ephemeral, which would defeat the cache. The path is outside
+  `~/.claude` and not in the push allowlist, so it is never synced.
+
+- **Boot-pull cost grew.** Pull now downloads every namespace's
+  `history.jsonl` *and* `.claude.json` (the latter ~30–37 KB each here),
+  vs one namespace before. At ~25 namespaces that's ~1 MB of extra
+  download — negligible now, but it scales linearly. v2 should use the
+  (now-honest) manifest to skip unchanged namespaces. Noted in SPEC.
+
+- **`mv -f`** in both merge write-backs: a developer shell with `mv`
+  aliased to `mv -i` would hang on the overwrite prompt. Boot scripts
+  run non-interactively as root so it wouldn't bite in production, but
+  `-f` is unconditionally correct.
+
+- **First-boot-with-metadata-down still forks** (no cache yet → uses
+  `hostname`). Rare, self-heals once metadata returns (the hostname
+  namespace becomes a small orphan). Documented in SPEC edge cases; a
+  fully fail-closed alternative (refuse to sync) was rejected because it
+  would also break local/dev testing where metadata never exists.
+
+- **No recovery migration written.** The 21 already-lost local entries
+  on the affected workstation will be restored automatically on its next
+  boot pull (the union now folds the bucket copies back in). I did not
+  write a one-shot backfill script; the next boot is the backfill.
+
+### Verified
+
+- `bash -n` on `270`, `271`, and the extracted loop heredoc body.
+- History merge against the live bucket's divergent namespaces:
+  union-complete, torn-tolerant, deduped, sorted, idempotent,
+  empty-result guard holds (never wipes a good file).
+- `.claude.json` merge: local oauth/onboarding/counters preserved,
+  per-project allowedTools preserved, history unioned + deduped,
+  remote-only project history imported, no empty stubs, idempotent,
+  invalid-base guard holds.
+- Push: torn last line stripped before upload; manifest advances only on
+  full success; invalid `.claude.json` skipped without failing the cycle.
+- `resolve_ws_id`: metadata→cache→hostname ordering; cache not poisoned
+  by hostname fallback; recovery restores the real id.
+
+### Not changed
+
+- The `cp -an` additive merge for `projects/`, `todos/`, `plans/`,
+  `session-env/` — already correct (no-clobber, no deletes).
+- The systemd/setsid launch logic and pidfile idempotency from the
+  2026-05-28 fix.
+- The push allowlist and the bucket/prefix layout.
+
+---
+
 ## 2026-05-28 — Fix: setsid fallback when systemd is not PID 1
 
 ### What was broken

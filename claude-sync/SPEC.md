@@ -150,20 +150,53 @@ The runtime contract on the workstation is unchanged: `270_*.sh` and `271_*.sh` 
 1. `200_remote-agent-setup.sh` (core) — fetches secrets, writes `/run/ra/env`, propagates env to `/etc/environment`.
 2. `250_claude-install.sh` (claude plugin) — installs claude on first boot.
 3. `260_claude-setup.sh` (claude plugin) — auth setup, seeds onboarding.
-4. **`270_claude-sync-pull.sh` (new)** — for each `gs://<bucket>/workstations/<ws-id>/` namespace:
+4. **`270_claude-sync-pull.sh` (new)** — for each `gs://<bucket>/claude-sync/workstations/<ws-id>/` namespace:
    - rsync **projects/** down → local `~/.claude/projects/`. Session JSONL filenames are UUIDs and don't collide across workstations. CLAUDE.md memory files inside `projects/<cwd>/memory/` are last-writer-wins by mtime (gcloud rsync respects mtime).
    - rsync **todos/**, **plans/**, **session-env/** down — also UUID-keyed, no collisions.
-   - For **history.jsonl** and **.claude.json**, only pull from the most-recently-updated namespace (per `_manifest/<ws-id>.json`'s `last_push_at`). This is last-writer-wins across workstations and is acceptable for v1 because the file's contents are predominantly local UI state (numStartups, tipsHistory, growthbook cache) plus onboarding flags.
+   - For **history.jsonl**, **union-merge**: fold local + **every** namespace's copy together, drop torn/invalid lines (`jq -R 'fromjson? // empty'`), dedup by `(timestamp, sessionId, display, project)`, sort by `timestamp`. `history.jsonl` is an append-only union log (one entry per session prompt); each workstation only ever sees its own sessions, so every namespace holds a *divergent partial copy*. Whole-file overwrite — the original v1 behavior — silently drops every entry not present in the "winning" copy. It must be merged, never replaced. **This is the fix for the session-loss bug** (see ADR 2026-06-07 below).
+   - For **.claude.json**, keep the **local** file as the authoritative base (it carries machine-local state: `oauthAccount`, onboarding flags, `numStartups`, `tipsHistory`) and union in only the per-project `history` arrays from every namespace. Foreign config is never imported — importing another workstation's `.claude.json` wholesale could clobber this machine's auth/onboarding.
+   - The boot pull **no longer reads `_manifest/<ws-id>.json` to pick a "winning" namespace** — the union merge is namespace-order-independent, so there is nothing to rank. The manifest is retained only for observability and future incremental-pull (v2).
 5. **`271_claude-sync-daemon.sh` (new)** — installs and starts the systemd unit.
 
 ### Steady state
 
-- Every 60s, the daemon `gcloud storage rsync`'s the filtered view of `~/.claude/` → `gs://<bucket>/workstations/<this-ws-id>/`, then updates `_manifest/<this-ws-id>.json` with the current timestamp.
+- Every 60s, the daemon `gcloud storage rsync`'s the filtered view of `~/.claude/` → `gs://<bucket>/claude-sync/workstations/<this-ws-id>/`.
+  - **`history.jsonl` is sanitized before upload**: it is filtered through `jq -R 'fromjson? // empty'` so a line torn by a concurrent claude append is never published; the next cycle re-ships the complete line.
+  - **`.claude.json` is validated** (`jq -e .`) before upload; an invalid (mid-write) read is skipped that cycle.
+- The manifest `_manifest/<this-ws-id>.json` is **only advanced when every push in the cycle succeeded**. A partial/failed push no longer advertises itself as "freshest" (see ADR 2026-06-07).
 - Rsync is incremental: it only re-uploads files whose contents (md5) changed. Steady-state bandwidth is small.
 
 ### Shutdown
 
 - No explicit hook. ≤60s of state may be lost if the workstation is killed between cycles. Acceptable since JSONLs are append-only and a new workstation re-syncs to the last persisted offset.
+
+---
+
+## ADR 2026-06-07 — Merge-based sync for append-only/shared files
+
+**Status:** accepted, supersedes the last-writer-wins-overwrite handling of `history.jsonl` and `.claude.json` described in the original v1 data flow.
+
+### Context
+
+An incident review found ≥21 session entries that existed in the GCS bucket but were missing from a workstation's local `history.jsonl`. Root cause: `history.jsonl` is an append-only union log (one line per session prompt, keyed by `sessionId`), but every workstation only ever appends the sessions *it* ran — so each namespace holds a **divergent partial copy** (measured: 46–127 lines across 25 namespaces; union = 148 unique). The v1 boot pull picked the single namespace with the newest `_manifest` timestamp and **whole-file-overwrote** local `history.jsonl` with that partial copy, destroying every entry the "winner" lacked. `.claude.json` was overwritten the same way. Three contributing bugs amplified this:
+
+1. The manifest timestamp was advanced even when the data upload failed (`|| true` on every `gcloud cp`), so the pull could elect a namespace whose data was stale/missing.
+2. `WS_ID` fell back from GCE metadata to `hostname` on any metadata blip; the two differ (`workstations-…` vs `personal`), so a single flap forked one workstation's history into two namespaces, which last-writer-wins then dropped.
+3. A claude append concurrent with the streaming rsync read could ship a torn last line, which then propagated.
+
+### Decision
+
+- **`history.jsonl` → union-merge on pull.** Fold local + every namespace's copy, drop torn lines (`jq -R 'fromjson? // empty'`), dedup by `(timestamp, sessionId, display, project)`, sort by `timestamp`. Namespace-order-independent and idempotent; recovers all previously-lost entries on the next boot. Write-back is atomic (`mktemp` + `mv`) and skipped if the merge yields empty (never wipes a good file on a jq failure).
+- **`.claude.json` → local base + history union.** The local file stays authoritative for all non-history fields (machine-local auth/onboarding/counters); only per-project `history` arrays are unioned in from other namespaces, order-preserving dedup. Foreign config is never imported. (Chosen over "stop syncing it" and "leave LWW" — see implementation-notes.)
+- **Manifest honesty (bug 1).** `push_once` tracks the exit status of every `gcloud` op and advances `_manifest/<ws>.json` only on a fully-successful cycle. The pull no longer *depends* on the manifest for correctness (the union merge removed that dependency), so this is now defense-in-depth + observability rather than load-bearing.
+- **Stable `WS_ID` (bug 2).** A single resolver — metadata (with brief retry, authoritative) → last-known-good cache at `/home/user/.ra-claude-sync/ws-id` (persistent home disk) → `hostname` only if both fail. Identical logic in `270` and the push loop so they cannot disagree.
+- **Torn-read tolerance (bug 3).** Push sanitizes `history.jsonl` and validates `.claude.json` before upload; pull drops unparseable lines / skips invalid `.claude.json` sources during the merge.
+
+### Consequences
+
+- Boot pull now downloads every namespace's `history.jsonl` and `.claude.json` (small + medium files) rather than one namespace's. At ~25 namespaces this is tens of MB of `.claude.json`; acceptable for boot, and a candidate for manifest-driven skip-unchanged in v2.
+- `jq` is now load-bearing on the pull path (already installed by `Dockerfile.d/110`).
+- The merge is union-only (no deletions ever propagate), consistent with the rest of the additive sync model.
 
 ---
 
@@ -181,16 +214,18 @@ The runtime contract on the workstation is unchanged: `270_*.sh` and `271_*.sh` 
 ## Edge cases
 
 - **Session JSONL collisions**: impossible — claude only writes to its own active session's JSONL (UUID-named).
+- **`history.jsonl` entry loss** (the original v1 bug): each workstation's `history.jsonl` is a partial view, and v1 overwrote local with one namespace's copy on boot → any session not in that copy vanished. **Fixed**: union-merge on pull (and per-cycle sanitize on push). See ADR 2026-06-07.
 - **CLAUDE.md memory file collisions** (same `projects/<cwd>/memory/notes.md` edited on two workstations simultaneously): last-writer-wins by mtime. v1 documents this; v2 can surface conflicts via `ra claude sync status`.
-- **`.claude.json` divergence** (numStartups, tipsHistory counters drift per workstation): last-writer-wins; not load-bearing — claude regenerates missing fields.
-- **Workstation killed mid-rsync**: `gcloud storage rsync` uploads whole files (not atomic across the set), so the destination namespace may be partially updated. Acceptable: next cycle reconciles. Pull-side merge tolerates partial namespaces.
+- **`.claude.json` divergence** (numStartups, tipsHistory counters drift per workstation): non-history fields are kept **local** (never imported from other namespaces); only per-project `history` arrays are unioned in. No machine's auth/onboarding can be clobbered by another's.
+- **Workstation killed mid-rsync**: `gcloud storage rsync` uploads whole files (not atomic across the set), so the destination namespace may be partially updated. Acceptable: next cycle reconciles, and the manifest only advances on a fully-successful cycle. Pull-side merge tolerates partial namespaces.
 - **Secrets leaking into transcripts**: session JSONLs may contain shell output, tool outputs, and pasted content. The bucket inherits project-level encryption and is IAM-locked to the workstation SA + project owners. Document this risk in the plugin README; recommend CMEK in v2.
 - **Bucket name globally unique**: derive as `ra-<project-id>-<sha1(user-email)[:8]>` to avoid collisions and not leak identifying info. Allow override via `bucket_name_override`. The name intentionally omits "claude" so other plugins can share the same bucket under their own prefixes.
 - **Stale namespaces from deleted workstations**: linger in GCS forever in v1. Document `gcloud storage rm -r gs://.../workstations/<old-ws-id>/` as the manual cleanup. v2 adds a lifecycle rule.
 - **`claude-sync` enabled but `claude` plugin missing**: documented in the plugin README. v1 noops if `/home/user/.claude/` doesn't exist.
-- **Concurrent claude write + rsync read**: `gcloud storage rsync` does a streaming read of each file; a partial write could ship a torn JSONL. Acceptable for v1; next cycle overwrites.
+- **Concurrent claude write + rsync read**: `gcloud storage rsync` does a streaming read of each file; a partial write could ship a torn JSONL/JSON. **Mitigated**: `history.jsonl` is sanitized before push and torn lines are dropped on merge; `.claude.json` is JSON-validated before push and skipped on merge if invalid.
 - **First-ever boot, empty bucket**: pull is a no-op. Push initializes the namespace.
 - **Bucket creation race when two workstations boot simultaneously**: `gcloud storage buckets create` is idempotent against describe pre-check.
+- **Workstation identity (`WS_ID`) instability**: metadata is authoritative and the last-known-good value is cached on the persistent home disk (`/home/user/.ra-claude-sync/ws-id`); a transient metadata blip reuses the cache instead of falling through to `hostname` and forking the namespace. `hostname` is a true last resort only when metadata is down *and* no cache exists (first boot). See ADR 2026-06-07.
 
 ---
 

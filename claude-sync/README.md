@@ -14,9 +14,14 @@ Allowlist — exactly these paths are pushed every cycle:
 - `todos/` — UUID-keyed todo state.
 - `plans/` — UUID-keyed plan documents.
 - `session-env/` — per-session environment captures.
-- `history.jsonl` — global command log (last-writer-wins across
-  workstations).
-- `.claude.json` — global config / onboarding state (last-writer-wins).
+- `history.jsonl` — global command log. **Union-merged** across
+  workstations on boot pull (it is an append-only log of session
+  prompts; each workstation holds only a partial view, so copies are
+  merged, never overwritten).
+- `.claude.json` — global config / onboarding state. The **local** file
+  is authoritative for all machine-local fields (auth, onboarding,
+  counters); only per-project `history` arrays are unioned in from other
+  workstations.
 
 Excluded (deliberately — local to each workstation):
 
@@ -39,11 +44,14 @@ Workstation B ──┘     claude-sync/             └── Workstation D
 
 - Each workstation pushes only to its own `claude-sync/workstations/<ws-id>/`
   prefix → no concurrent-write contention.
-- Boot pull merges every other namespace into `~/.claude/` via
-  `cp -an` (newer local files win).
-- `claude-sync/_manifest/<ws-id>.json` carries `last_push_at_epoch` so
-  the boot pull picks the freshest namespace for last-writer-wins files
-  (`history.jsonl`, `.claude.json`).
+- Boot pull merges every other namespace into `~/.claude/`:
+  `projects/`, `todos/`, `plans/`, `session-env/` via `cp -an` (newer
+  local files win); `history.jsonl` via union-merge; `.claude.json` via
+  local-base + per-project history union.
+- `claude-sync/_manifest/<ws-id>.json` carries `last_push_at_epoch`,
+  advanced only on a fully-successful push cycle. It is retained for
+  observability and future incremental pull; the boot pull no longer
+  needs it to choose a namespace (the union merge is order-independent).
 - The bucket name (`ra-<project>-<hash>`) omits "claude" so future plugins
   can share it under their own prefixes.
 
@@ -131,12 +139,19 @@ workstations. Recommended: install both plugins together.
 
 ## Caveats
 
-- ≤60s of state can be lost if a workstation is killed between push
-  cycles (the next workstation creation picks up from where the last
-  push left off).
+- ≤`interval_seconds` of state can be lost if a workstation is killed
+  between push cycles (the next boot pull picks up the union of whatever
+  was last persisted across all namespaces).
 - `gcloud storage rsync` re-uploads whole files on any byte change. A
   long-running session whose JSONL grows to 50 MB will re-upload all
-  50 MB once per minute. v2 plans a delta-append approach.
+  50 MB once per cycle. v2 plans a delta-append approach.
 - Per-workstation namespacing means CLAUDE.md memory edits made on
   workstation A and workstation B in parallel use last-merge-order on
   pull; no conflict UI yet.
+- Boot pull cost grows with namespace count: it now folds in every
+  namespace's `history.jsonl` and `.claude.json`. Fine at tens of
+  workstations; v2 will skip unchanged namespaces via the manifest.
+- `.claude.json` merge can create a project entry containing only a
+  `history` array for projects you have never opened on this workstation
+  (so prior up-arrow history is available when you first `cd` there).
+  claude fills the remaining project fields with defaults.
