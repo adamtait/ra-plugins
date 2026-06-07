@@ -72,9 +72,12 @@ resolve_ws_id() {
 
 # Union-merge JSONL files into a destination, in place.
 #   $1 = destination path ; $2.. = extra source files to fold in.
-# Tolerates torn/invalid lines (fromjson? // empty), dedups on a stable
-# composite key, sorts by timestamp. Atomic write-back; never replaces
-# the destination with an empty result (guards against a jq failure
+# Tolerates torn/invalid lines (fromjson? // empty), drops only exact
+# duplicate objects (`unique` — never drops a record that merely shares a
+# timestamp/sessionId with another), sorts by timestamp. The temp file is
+# created in the destination's own directory so the write-back is a true
+# atomic rename (mv across filesystems would be a non-atomic copy). Never
+# replaces the destination with an empty result (guards a jq failure from
 # wiping history).
 merge_jsonl_history() {
     local dest="$1"; shift
@@ -83,11 +86,10 @@ merge_jsonl_history() {
     local f
     for f in "$@"; do [ -f "${f}" ] && files+=("${f}"); done
     [ "${#files[@]}" -gt 0 ] || return 0
-    local tmp; tmp="$(mktemp)"
+    local tmp; tmp="$(mktemp "${dest}.merge.XXXXXX")"
     if cat "${files[@]}" 2>>"${LOG_FILE}" \
         | jq -R -c 'fromjson? // empty | select(type=="object")' 2>>"${LOG_FILE}" \
-        | jq -s -c 'unique_by([.timestamp, .sessionId, .display, (.project // "")])
-                    | sort_by(.timestamp // 0) | .[]' 2>>"${LOG_FILE}" > "${tmp}"; then
+        | jq -s -c 'unique | sort_by(.timestamp // 0) | .[]' 2>>"${LOG_FILE}" > "${tmp}"; then
         if [ -s "${tmp}" ]; then
             mv -f "${tmp}" "${dest}"
             return 0
@@ -113,7 +115,8 @@ merge_claude_json() {
         jq -e . "${f}" >/dev/null 2>&1 && rfiles+=("${f}")
     done
     [ "${#rfiles[@]}" -gt 0 ] || return 0
-    local tmp; tmp="$(mktemp)"
+    # Temp in the destination's own directory → atomic rename on write-back.
+    local tmp; tmp="$(mktemp "${base}.merge.XXXXXX")"
     if jq -s '
         # order-preserving unique (history entries have no timestamp to sort by)
         def dedup_keep_order: reduce .[] as $x ([]; if any(.[]; . == $x) then . else . + [$x] end);
