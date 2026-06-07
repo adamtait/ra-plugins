@@ -143,6 +143,22 @@ all four orderings.
 - `resolve_ws_id`: metadata→cache→hostname ordering; cache not poisoned
   by hostname fallback; recovery restores the real id.
 
+### Review fixes applied (/review on PR #4)
+
+- **Atomic write-back.** The merge temp files were created with bare
+  `mktemp` (→ `/tmp`), but the destinations live under `/home`. On Cloud
+  Workstations `/tmp` and `/home` are different mounts, so `mv` was a
+  non-atomic copy a crash could truncate mid-write — corrupting
+  `history.jsonl`/`.claude.json`. Fixed: `mktemp "${dest}.merge.XXXXXX"`
+  in the destination's own directory so the write-back is a true rename.
+  (The `.merge.XXXXXX` suffix is not in the push allowlist, so a leftover
+  is never synced.)
+- **Safer dedup.** Switched history dedup from
+  `unique_by([timestamp,sessionId,display,project])` to full-object
+  `unique`, so a genuinely-distinct entry sharing that 4-tuple is never
+  dropped. Cross-namespace duplicates are byte-identical, so exact-object
+  dedup is sufficient and strictly safer.
+
 ### Not changed
 
 - The `cp -an` additive merge for `projects/`, `todos/`, `plans/`,
