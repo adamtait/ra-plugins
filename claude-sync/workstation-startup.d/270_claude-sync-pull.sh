@@ -166,10 +166,33 @@ fi
 
 BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
 
-WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
+# Namespace selection (load-reduction plan #3). When `ra create` injected
+# RA_PLUGIN_CLAUDE_SYNC_NAMESPACE — a stable id derived from (project,
+# config_name, user_email) — prefer it so a rebuilt workstation reuses ONE
+# namespace instead of spawning a fresh UUID namespace every create. Fall
+# back to resolve_ws_id() (metadata / cached / hostname) only when the env
+# var is unset, preserving the pre-#3 behavior. Keep this block in sync
+# with the identical selection in 271_*.sh.
+if [ -n "${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE:-}" ]; then
+    WS_ID="${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE}"
+    log "using stable namespace from RA_PLUGIN_CLAUDE_SYNC_NAMESPACE=${WS_ID}"
+else
+    WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
+fi
 PLUGIN_PREFIX="gs://${BUCKET}/claude-sync"
 
-log "starting pull as ws-id=${WS_ID} from ${PLUGIN_PREFIX}"
+# Recency/age filter knobs (load-reduction plan #1). Namespaces accumulate
+# one-per-workstation forever with no GC; the cross-namespace pull cost
+# grew unbounded. We rank candidate namespaces by their manifest's
+# last_push_at_epoch, then pull only those active within MAX_AGE_DAYS AND
+# cap to the MAX_NAMESPACES most recent. Both are configurable via plugin
+# config; defaults below match SPEC.md.
+MAX_AGE_DAYS="${RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_AGE_DAYS:-30}"
+MAX_NAMESPACES="${RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_NAMESPACES:-15}"
+case "${MAX_AGE_DAYS}" in *[!0-9]*|"") MAX_AGE_DAYS=30 ;; esac
+case "${MAX_NAMESPACES}" in *[!0-9]*|"") MAX_NAMESPACES=15 ;; esac
+
+log "starting pull as ws-id=${WS_ID} from ${PLUGIN_PREFIX} (max_age_days=${MAX_AGE_DAYS} max_namespaces=${MAX_NAMESPACES})"
 
 mkdir -p "${USER_HOME}/.claude"
 
@@ -184,16 +207,90 @@ if [ "${#NAMESPACES[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# --- Recency/age-filtered + capped namespace selection (plan #1) -------------
+# Without GC, every past `ra create` leaves an ~85 MB namespace behind, so
+# an unfiltered pull rsyncs gigabytes across dozens of dead namespaces on
+# every boot. Rank by each manifest's last_push_at_epoch and pull only the
+# namespaces that are (a) newer than MAX_AGE_DAYS and (b) within the
+# MAX_NAMESPACES most-recent. Our own WS_ID is always skipped (we push it,
+# never pull it). A missing/invalid manifest is treated as epoch 0 — the
+# oldest possible — so undated namespaces fall off first and never crowd
+# out a dated, active one. Every exclusion is logged; nothing is silently
+# truncated.
+#
+# now/cutoff in epoch seconds; cutoff=0 disables the age gate when
+# MAX_AGE_DAYS=0 (cap-only mode).
+now_epoch="$(date -u +%s)"
+if [ "${MAX_AGE_DAYS}" -gt 0 ]; then
+    cutoff_epoch=$(( now_epoch - MAX_AGE_DAYS * 86400 ))
+else
+    cutoff_epoch=0
+fi
+
+# Build "<epoch>\t<namespace-uri>" rows for every candidate (excluding our
+# own namespace), reading each manifest once via a cheap `gcloud storage
+# cat`. Then sort newest-first and apply the TTL + cap.
+ranked_rows=""
+for ns in "${NAMESPACES[@]}"; do
+    ns_id="${ns%/}"; ns_id="${ns_id##*/}"
+    [ -z "${ns_id}" ] && continue
+    if [ "${ns_id}" = "${WS_ID}" ]; then
+        log "skip ${ns_id}: own namespace (push-only)"
+        continue
+    fi
+    ts="$(gcloud storage cat "${PLUGIN_PREFIX}/_manifest/${ns_id}.json" 2>>"${LOG_FILE}" \
+          | jq -r '.last_push_at_epoch // 0' 2>>"${LOG_FILE}" || echo 0)"
+    ts="${ts:-0}"
+    case "${ts}" in *[!0-9]*) ts=0 ;; esac
+    ranked_rows+="${ts}	${ns}"$'\n'
+done
+
+# Sort by epoch descending (newest first). `sort -rn` keys on the leading
+# numeric epoch field; the tab-separated URI rides along untouched.
+mapfile -t ranked_sorted < <(printf '%s' "${ranked_rows}" | sort -rn -k1,1 | sed '/^$/d')
+
+PULL_NS=()
+kept=0
+for row in "${ranked_sorted[@]}"; do
+    ts="${row%%	*}"
+    ns="${row#*	}"
+    ns_id="${ns%/}"; ns_id="${ns_id##*/}"
+    # Age gate (skipped when cutoff_epoch=0). ts=0 (missing/invalid
+    # manifest) always fails a non-zero cutoff, so undated namespaces are
+    # dropped first — exactly the intended "oldest" treatment.
+    if [ "${cutoff_epoch}" -gt 0 ] && [ "${ts}" -lt "${cutoff_epoch}" ]; then
+        if [ "${ts}" -eq 0 ]; then
+            log "skip ${ns_id}: no/invalid manifest (treated as oldest, beyond ${MAX_AGE_DAYS}d TTL)"
+        else
+            log "skip ${ns_id}: last_push_at_epoch=${ts} older than ${MAX_AGE_DAYS}d TTL (cutoff=${cutoff_epoch})"
+        fi
+        continue
+    fi
+    # Recency cap.
+    if [ "${kept}" -ge "${MAX_NAMESPACES}" ]; then
+        log "skip ${ns_id}: beyond top-${MAX_NAMESPACES} recency cap (last_push_at_epoch=${ts})"
+        continue
+    fi
+    PULL_NS+=("${ns}")
+    kept=$((kept + 1))
+done
+
+log "selected ${kept} of ${#NAMESPACES[@]} namespace(s) for pull"
+if [ "${kept}" -eq 0 ]; then
+    log "no eligible namespaces after age/cap filter — nothing to pull"
+    chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.claude"
+    exit 0
+fi
+
 # Stage everything into a tmpdir so the existing live tree is unaffected
 # until we cp-no-clobber / merge on top.
 STAGE="$(mktemp -d)"
 trap 'rm -rf "${STAGE}"' EXIT
 mkdir -p "${STAGE}/history" "${STAGE}/claudejson"
 
-for ns in "${NAMESPACES[@]}"; do
+for ns in "${PULL_NS[@]}"; do
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
     [ -z "${ns_id}" ] && continue
-    [ "${ns_id}" = "${WS_ID}" ] && continue
     log "staging namespace ${ns_id}"
     for sub in projects todos plans session-env; do
         mkdir -p "${STAGE}/${sub}"

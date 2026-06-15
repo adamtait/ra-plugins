@@ -220,7 +220,8 @@ An incident review found ≥21 session entries that existed in the GCS bucket bu
 - **Workstation killed mid-rsync**: `gcloud storage rsync` uploads whole files (not atomic across the set), so the destination namespace may be partially updated. Acceptable: next cycle reconciles, and the manifest only advances on a fully-successful cycle. Pull-side merge tolerates partial namespaces.
 - **Secrets leaking into transcripts**: session JSONLs may contain shell output, tool outputs, and pasted content. The bucket inherits project-level encryption and is IAM-locked to the workstation SA + project owners. Document this risk in the plugin README; recommend CMEK in v2.
 - **Bucket name globally unique**: derive as `ra-<project-id>-<sha1(user-email)[:8]>` to avoid collisions and not leak identifying info. Allow override via `bucket_name_override`. The name intentionally omits "claude" so other plugins can share the same bucket under their own prefixes.
-- **Stale namespaces from deleted workstations**: linger in GCS forever in v1. Document `gcloud storage rm -r gs://.../workstations/<old-ws-id>/` as the manual cleanup. v2 adds a lifecycle rule.
+- **Stale namespaces from deleted workstations**: previously lingered in GCS forever and were merged on every boot. **Mitigated** by the load-reduction work (see "Load reduction" below): the boot pull now age/cap-filters namespaces and a bucket lifecycle rule cheapens/deletes old data. Manual cleanup is still `gcloud storage rm -r gs://.../workstations/<old-ws-id>/` plus the matching `_manifest/<old-ws-id>.json`.
+- **Namespace sprawl from per-create UUIDs**: `WS_ID` defaulted to the GCE instance name, a fresh UUID every `ra create`, so a workstation rebuilt N times left N namespaces (~85 MB each) that nothing pruned. **Mitigated** by the stable namespace (load-reduction #3): `ra create` injects `RA_PLUGIN_CLAUDE_SYNC_NAMESPACE`, derived from (project, config_name, user_email), and both scripts prefer it — a rebuild reuses ONE namespace.
 - **`claude-sync` enabled but `claude` plugin missing**: documented in the plugin README. v1 noops if `/home/user/.claude/` doesn't exist.
 - **Concurrent claude write + rsync read**: `gcloud storage rsync` does a streaming read of each file; a partial write could ship a torn JSONL/JSON. **Mitigated**: `history.jsonl` is sanitized before push and torn lines are dropped on merge; `.claude.json` is JSON-validated before push and skipped on merge if invalid.
 - **First-ever boot, empty bucket**: pull is a no-op. Push initializes the namespace.
@@ -249,6 +250,87 @@ An incident review found ≥21 session entries that existed in the GCS bucket bu
 
 ---
 
+## Load reduction (2026-06)
+
+By mid-2026 the sync bucket held ~36 namespaces / ~2.2 GB (~85 MB each)
+and was growing without bound: `WS_ID` defaulted to the ephemeral GCE
+instance name (new every `ra create`) and nothing ever pruned. The
+detached boot pull (PR #5) stopped the pull from breaking boot, but the
+background pull cost still scaled with the dead-namespace count. Three
+changes bound the cost.
+
+### #1 — Recency/age-filtered + capped boot pull (`270_*.sh`)
+
+Before staging, the pull ranks every candidate namespace by its
+`_manifest/<ns>.json` `last_push_at_epoch` and pulls only those that are
+**both** newer than `pull_max_age_days` **and** within the
+`pull_max_namespaces` most-recent. Our own `WS_ID` is always skipped
+(push-only). A missing/invalid manifest is treated as epoch 0 — the
+oldest possible — so undated namespaces fall off first and never crowd
+out a dated, active one. Every exclusion is logged (own-namespace,
+beyond-TTL, no-manifest, beyond-cap); nothing is silently truncated.
+
+Config keys (surfaced to the script as
+`RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_AGE_DAYS` /
+`RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_NAMESPACES`):
+
+| Key                   | Default | Meaning                                                        |
+|-----------------------|---------|----------------------------------------------------------------|
+| `pull_max_age_days`   | `30`    | Only merge namespaces pushed within this many days. `0` = no age limit (cap-only). |
+| `pull_max_namespaces` | `15`    | Cap the merge to the N most-recently-pushed namespaces.        |
+
+The last-writer-wins / union-merge model is unchanged — it just operates
+over the filtered set. Historical UUID namespaces are still merged from
+until they age out of the window, then they stop being read at all.
+
+### #3 — Stable per-user namespace (`ra` core + `270_*.sh` + `271_*.sh`)
+
+`ra create`'s `buildContainerEnv` injects
+`RA_PLUGIN_CLAUDE_SYNC_NAMESPACE`, a deterministic id derived from
+`(gcloud project, workstation config_name, git user_email)` — lowercased,
+restricted to `[a-z0-9_-]`, slash-free, and suffixed with an 8-hex digest
+of the raw triple so distinct triples never collide. Injection is gated on
+the plugin being enabled and added to `RA_PROPAGATE_KEYS`. Both scripts
+prefer this env var over `resolve_ws_id()` and fall back to the metadata/
+cache/hostname chain only when it is unset.
+
+**Migration**: existing UUID namespaces remain in the bucket as read-only
+history. The filtered pull (#1) keeps merging from them until they age out
+of the `pull_max_age_days` / `pull_max_namespaces` window; meanwhile the
+workstation pushes only to the new stable namespace. No data is moved or
+deleted as part of enabling #3 — the old namespaces simply stop receiving
+writes and eventually stop being read, then the lifecycle rule (#4)
+reclaims them.
+
+### #4 — Bucket Object Lifecycle Management (`plugin.yaml` + `ra` core)
+
+The `state` bucket's `buckets[].lifecycle:` declaration carries two rules,
+both scoped to the `claude-sync/` prefix via `matchesPrefix` so they never
+touch objects other plugins write into the shared bucket:
+
+1. `SetStorageClass COLDLINE` after `age_days: 90` — cheapen at-rest cost
+   for data the #1 age filter has long stopped reading.
+2. `Delete` after `age_days: 365` — well beyond the 30-day pull TTL, so by
+   the time it fires the data is provably unused.
+
+`ra create` applies these idempotently after `EnsureBucket` (GCS replaces
+the whole lifecycle config each call). The mechanism is generic in core —
+any plugin can declare `lifecycle:` on a bucket; no claude-sync name is
+hard-coded. See the plugin README for the equivalent
+`gcloud storage buckets update --lifecycle-file` runbook (the fallback if
+you cannot re-run `ra create`).
+
+**Optional, not implemented**: a periodic "archive idle namespaces" sweep
+that moves namespaces idle > N days under a `workstations-archive/` prefix
+so the boot `gcloud storage ls` listing stays small even before lifecycle
+deletion fires. With #1 already capping how many namespaces are *read*,
+this is only worth doing if the raw `ls` of `workstations/` itself becomes
+slow (hundreds+ of entries). It would be a separate cron/`ExecStartPost`
+job; the pull would also need to list `workstations-archive/` to keep
+merging recently-archived data within the TTL.
+
+---
+
 ## v2 improvements
 
 - **Real-time sync** via inotify + GCS Go client.
@@ -256,7 +338,6 @@ An incident review found ≥21 session entries that existed in the GCS bucket bu
 - **CLI surface**: `ra claude sync push|pull|status|diff|reset|gc`.
 - **Conflict surfacing**: detect mtime-tied edits and prompt to choose.
 - **Team sharing**: `shared/` prefix + per-user IAM grants.
-- **Lifecycle / GC**: bucket lifecycle rule auto-deletes namespaces 30 days after last update.
 - **Encryption**: CMEK on the bucket; client-side encryption for high-sensitivity workstations.
 - **Selective sync**: per-project include/exclude patterns.
 - **Backend abstraction**: swap GCS for S3/R2 via a `backend:` field.

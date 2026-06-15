@@ -14,6 +14,48 @@ Format per entry:
 
 ---
 
+## 2026-06-14 — Load reduction: filtered pull, stable namespace, bucket lifecycle
+
+**Decision:** Three changes to bound the sync bucket's unbounded growth
+(~36 namespaces / ~2.2 GB by mid-2026, ~85 MB each, never pruned). See
+`SPEC.md` "Load reduction (2026-06)" for the full design.
+
+- **#1 Filtered pull** (`270_*.sh`): rank namespaces by manifest
+  `last_push_at_epoch`, pull only those within `pull_max_age_days`
+  (default 30) AND the top `pull_max_namespaces` (default 15) by recency.
+  Missing/invalid manifest → epoch 0 (oldest, dropped first). Own
+  namespace always skipped. Every exclusion logged.
+- **#3 Stable namespace** (`ra` core + both scripts): `ra create` injects
+  `RA_PLUGIN_CLAUDE_SYNC_NAMESPACE`, derived from
+  `(project, config_name, user_email)`, lowercased / `[a-z0-9_-]` /
+  slash-free / 8-hex-digest-suffixed. Both scripts prefer it over
+  `resolve_ws_id()`. A rebuilt workstation now reuses one namespace.
+- **#4 Lifecycle** (`plugin.yaml` + `ra` core): generic
+  `buckets[].lifecycle:` declaration applied idempotently by `ra create`.
+  Coldline at 90d, Delete at 365d, both scoped to the `claude-sync/`
+  prefix.
+
+**Why:** The detached boot pull (PR #5) stopped the pull from breaking
+boot but the background cost still scaled with dead-namespace count.
+Defaults are conservative (the 30-day pull TTL fits comfortably inside the
+90-day Coldline / 365-day Delete horizons) so no live data is at risk.
+
+**Tradeoff:** #1 is recency-biased — a namespace untouched for >30 days
+stops being merged even if it holds unique history; it remains in the
+bucket (read-only) until the lifecycle Delete fires, recoverable by
+raising `pull_max_age_days`. #3's namespace id is a hash of
+`config_name`; renaming the workstation config forks the namespace once
+(old data still merged via #1 until it ages out). #4 replaces the bucket's
+*entire* lifecycle config on each `ra create`, so an out-of-band rule
+added by hand would be overwritten — declare all rules in `plugin.yaml`.
+
+**Not implemented (documented only):** the "move idle namespaces to
+`workstations-archive/`" sweep — #1 already caps how many namespaces are
+read, so it is only worth adding if the raw `ls workstations/` itself
+slows down. Design sketch in `SPEC.md`.
+
+---
+
 ## 2026-06-07 — Fix: session loss from whole-file overwrite of history.jsonl
 
 ### What was broken
@@ -576,7 +618,6 @@ implement:
 - `ra claude sync` CLI subcommands (push/pull/status/diff/reset/gc).
 - Conflict surfacing UI.
 - Multi-user team sharing via `shared/` prefix.
-- Bucket lifecycle / garbage collection for deleted workstations.
 - CMEK / client-side encryption.
 - Selective per-project include/exclude.
 - Non-GCS backends.
