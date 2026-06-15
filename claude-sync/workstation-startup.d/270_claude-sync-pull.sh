@@ -227,9 +227,18 @@ else
     cutoff_epoch=0
 fi
 
+# Fetch all namespace manifests in ONE gcloud round-trip instead of one
+# `gcloud storage cat` per namespace — ranking N namespaces otherwise pays
+# N gcloud cold-starts (tens of seconds, and N chances to flake). Mirror
+# them locally, best-effort: a namespace whose manifest is missing or
+# unreadable falls through to epoch 0 below (treated as oldest), as before.
+manifest_dir="$(mktemp -d)"
+gcloud storage rsync --recursive \
+    "${PLUGIN_PREFIX}/_manifest/" "${manifest_dir}/" 2>>"${LOG_FILE}" || true
+
 # Build "<epoch>\t<namespace-uri>" rows for every candidate (excluding our
-# own namespace), reading each manifest once via a cheap `gcloud storage
-# cat`. Then sort newest-first and apply the TTL + cap.
+# own namespace), reading each manifest from the local mirror. Then sort
+# newest-first and apply the TTL + cap.
 ranked_rows=""
 for ns in "${NAMESPACES[@]}"; do
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
@@ -238,12 +247,12 @@ for ns in "${NAMESPACES[@]}"; do
         log "skip ${ns_id}: own namespace (push-only)"
         continue
     fi
-    ts="$(gcloud storage cat "${PLUGIN_PREFIX}/_manifest/${ns_id}.json" 2>>"${LOG_FILE}" \
-          | jq -r '.last_push_at_epoch // 0' 2>>"${LOG_FILE}" || echo 0)"
+    ts="$(jq -r '.last_push_at_epoch // 0' "${manifest_dir}/${ns_id}.json" 2>>"${LOG_FILE}" || echo 0)"
     ts="${ts:-0}"
     case "${ts}" in *[!0-9]*) ts=0 ;; esac
     ranked_rows+="${ts}	${ns}"$'\n'
 done
+rm -rf "${manifest_dir}"
 
 # Sort by epoch descending (newest first). `sort -rn` keys on the leading
 # numeric epoch field; the tab-separated URI rides along untouched.
