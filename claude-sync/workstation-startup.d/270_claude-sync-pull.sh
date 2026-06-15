@@ -21,6 +21,22 @@
 #     unioned in from other namespaces. Foreign config is never imported.
 set -euo pipefail
 
+# --- Detach so the boot pull never blocks workstation startup ----------------
+# The cross-namespace pull can move hundreds of MB across dozens of GCS
+# namespaces and take many minutes. Run inline, it blocks the
+# /etc/workstation-startup.d/ sequence long enough that Cloud Workstations
+# tears the container down mid-boot — sshd never stabilizes and `ra connect`
+# fails with "the workstation does not have a server running on port 22".
+# Re-exec ourselves once, detached into a new session via `setsid --fork`
+# (same pattern as the push daemon in 271_*.sh), and return immediately so
+# boot completes; the pull then runs to completion in the background.
+# RA_CLAUDE_SYNC_PULL_DETACHED guards against infinite re-exec.
+if [ "${RA_CLAUDE_SYNC_PULL_DETACHED:-0}" != "1" ]; then
+    export RA_CLAUDE_SYNC_PULL_DETACHED=1
+    setsid --fork "$0" </dev/null >/dev/null 2>&1
+    exit 0
+fi
+
 USER_NAME="user"
 USER_HOME="/home/${USER_NAME}"
 LOG_FILE="/var/log/ra-claude-sync.log"
