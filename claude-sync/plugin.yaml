@@ -32,6 +32,15 @@ buckets:
         age_days: 365
         prefixes:
           - "claude-sync/"
+# Stable namespace (load-reduction plan #3). Opt into ra core's generic
+# stable-id injection: core derives a deterministic id from (project,
+# config_name, user_email) — stable across `ra create` rebuilds, unlike
+# the GCE instance UUID — and exports it under this env var. 270/271 prefer
+# it over resolve_ws_id(), so a rebuilt workstation reuses ONE namespace
+# instead of spawning a fresh one each create. Core hard-codes nothing; the
+# env var name lives here, in the plugin's own declaration.
+stable_id:
+  env_var: RA_PLUGIN_CLAUDE_SYNC_NAMESPACE
 config:
   - name: enabled
     type: bool
