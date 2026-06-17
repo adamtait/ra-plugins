@@ -19,7 +19,11 @@ apt-get update
 apt-get install -y --no-install-recommends software-properties-common
 add-apt-repository -y ppa:jgmath2000/et
 apt-get update
-apt-get install -y --no-install-recommends et
+# `et` is the server/client; `iproute2` provides `ss`, which the base ra image
+# does not ship — having it makes the workstation's network state inspectable
+# (e.g. `ss -tlnp`) when debugging a tunnel. The boot script's port check does
+# not depend on it (it reads /proc/net/tcp directly); this is for operability.
+apt-get install -y --no-install-recommends et iproute2
 
 # The package ships a systemd unit, but ra workstations do not run systemd
 # (PID 1 is the workstation entrypoint), so that unit never starts. Boot-time
