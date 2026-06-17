@@ -22,6 +22,19 @@ ET_LOG="/var/log/et-start.log"
 
 port="${RA_PLUGIN_ET_PORT_FOR_TUNNEL:-2022}"
 
+# port_listening <port> — succeeds if a local socket is in LISTEN state on the
+# port. Reads the kernel's own table (/proc/net/tcp + tcp6) directly: the ra
+# workstation image ships neither `ss` nor `netstat`, so parse what they would
+# parse. Local addresses there are HEXIP:HEXPORT and LISTEN is state 0A, so the
+# port is matched as an uppercase 4-digit hex suffix. Passive — no connection is
+# opened against whatever holds the port.
+port_listening() {
+    local hex
+    hex=$(printf ':%04X' "$1")
+    awk -v p="${hex}" '$2 ~ (p"$") && $4 == "0A" { found = 1 } END { exit(found ? 0 : 1) }' \
+        /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+
 # Validate the port. The schema declares the tunnel port, but RA_PLUGIN_* values
 # are unquoted env strings and nothing re-checks them on the workstation side.
 if [[ ! "${port}" =~ ^[0-9]+$ ]] || [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ]; then
@@ -38,7 +51,7 @@ fi
 
 # Port collision pre-check — without this, etserver bind-fails into the log and
 # the user sees an unreachable port with no obvious cause.
-if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :${port}" 2>/dev/null | grep -q .; then
+if port_listening "${port}"; then
     echo "[et-start] port ${port} already in use; aborting." >&2
     exit 1
 fi
