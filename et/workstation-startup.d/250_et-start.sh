@@ -37,8 +37,12 @@ if pgrep -x etserver >/dev/null 2>&1; then
 fi
 
 # Port collision pre-check — without this, etserver bind-fails into the log and
-# the user sees an unreachable port with no obvious cause.
-if command -v ss >/dev/null 2>&1 && ss -tlnH "sport = :${port}" 2>/dev/null | grep -q .; then
+# the user sees an unreachable port with no obvious cause. Probe the port by
+# dialing it directly rather than parsing `ss`: `ss` has been observed to report
+# no sockets in the workstation container even when listeners exist, which would
+# make an ss-based check a silent no-op. A successful /dev/tcp connect means
+# something already holds the port.
+if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
     echo "[et-start] port ${port} already in use; aborting." >&2
     exit 1
 fi
