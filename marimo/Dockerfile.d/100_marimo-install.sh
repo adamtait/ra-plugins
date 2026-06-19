@@ -8,11 +8,11 @@
 # installed the uv plugin separately.
 set -euo pipefail
 
+# Retry transient network failures (e.g. GitHub 5xx) instead of aborting the build.
+CURL_RETRY="--retry 5 --retry-connrefused --connect-timeout 30"
+
 # --- Phase A: ensure uv is present ----------------------------------------
 if [ ! -x /usr/local/bin/uv ]; then
-    UV_VERSION=$(curl -fsSL https://api.github.com/repos/astral-sh/uv/releases/latest \
-        | grep '"tag_name"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-
     arch=$(uname -m)
     case "${arch}" in
         x86_64)  uv_arch="x86_64-unknown-linux-gnu" ;;
@@ -27,10 +27,12 @@ if [ ! -x /usr/local/bin/uv ]; then
     trap 'rm -rf "${tmpdir}"' EXIT
 
     UV_ARCHIVE="uv-${uv_arch}.tar.gz"
-    UV_BASE="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}"
+    # GitHub's releases/latest/download/ redirect resolves "latest" via the
+    # release CDN, avoiding the rate-limited api.github.com endpoint entirely.
+    UV_BASE="https://github.com/astral-sh/uv/releases/latest/download"
 
-    curl -fsSL "${UV_BASE}/${UV_ARCHIVE}"        -o "${tmpdir}/${UV_ARCHIVE}"
-    curl -fsSL "${UV_BASE}/${UV_ARCHIVE}.sha256" -o "${tmpdir}/${UV_ARCHIVE}.sha256"
+    curl $CURL_RETRY -fsSL "${UV_BASE}/${UV_ARCHIVE}"        -o "${tmpdir}/${UV_ARCHIVE}"
+    curl $CURL_RETRY -fsSL "${UV_BASE}/${UV_ARCHIVE}.sha256" -o "${tmpdir}/${UV_ARCHIVE}.sha256"
 
     # Verify the downloaded tarball against the upstream-published checksum
     # (file format is the standard `<hash>  <filename>` accepted by `sha256sum -c`).

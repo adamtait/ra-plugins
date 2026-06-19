@@ -22,7 +22,8 @@ if [ -x /usr/local/bin/agy ]; then
     exit 0
 fi
 
-curl -fsSL https://antigravity.google/cli/install.sh \
+# Retry transient network failures (e.g. 5xx) instead of aborting the build.
+curl --retry 5 --retry-connrefused --connect-timeout 30 -fsSL https://antigravity.google/cli/install.sh \
     | bash -s -- --dir /usr/local/bin
 
 agy --version

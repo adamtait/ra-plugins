@@ -4,8 +4,11 @@ set -euo pipefail
 
 TF_DEST="/usr/local/bin/terraform"
 
+# Retry transient network failures (e.g. 5xx) instead of aborting the build.
+CURL_RETRY="--retry 5 --retry-connrefused --connect-timeout 30"
+
 # HashiCorp's checkpoint API avoids the unauthenticated GitHub API rate limit.
-TF_VERSION=$(curl -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform \
+TF_VERSION=$(curl $CURL_RETRY -fsSL https://checkpoint-api.hashicorp.com/v1/check/terraform \
     | grep -o '"current_version":"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 
 if [ -z "${TF_VERSION}" ]; then
@@ -42,8 +45,8 @@ TF_SUMS_URL="${TF_BASE}/terraform_${TF_VERSION}_SHA256SUMS"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
 
-curl -fsSL "${TF_URL}" -o "${tmpdir}/${TF_ARCHIVE}"
-curl -fsSL "${TF_SUMS_URL}" -o "${tmpdir}/SHA256SUMS"
+curl $CURL_RETRY -fsSL "${TF_URL}" -o "${tmpdir}/${TF_ARCHIVE}"
+curl $CURL_RETRY -fsSL "${TF_SUMS_URL}" -o "${tmpdir}/SHA256SUMS"
 
 # Verify the downloaded archive against HashiCorp's published checksum.
 # Filter SHA256SUMS to just our archive so sha256sum -c doesn't choke on
