@@ -11,8 +11,10 @@ CURL_RETRY="--retry 5 --retry-connrefused --connect-timeout 30"
 # need to know it before downloading.
 BB_VERSION=$(curl $CURL_RETRY -fsSL -o /dev/null -w '%{url_effective}' \
     https://github.com/babashka/babashka/releases/latest | sed 's#.*/tag/v##')
-if [ -z "${BB_VERSION}" ]; then
-    echo "Failed to determine latest babashka version" >&2
+# Validate the parse: a failed sed match returns the input unchanged (the full
+# URL), so check for a version shape rather than just non-empty.
+if ! printf '%s' "${BB_VERSION}" | grep -qE '^[0-9]+\.[0-9]+'; then
+    echo "Failed to determine latest babashka version (got: '${BB_VERSION}')" >&2
     exit 1
 fi
 BB_ARCHIVE="babashka-${BB_VERSION}-linux-amd64-static.tar.gz"

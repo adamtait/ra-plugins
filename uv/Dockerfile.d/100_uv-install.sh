@@ -24,9 +24,12 @@ tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
 
 # GitHub's releases/latest/download/ redirect resolves "latest" via the release
-# CDN, avoiding the rate-limited api.github.com endpoint entirely.
+# CDN, avoiding the rate-limited api.github.com endpoint entirely. Download to a
+# file before extracting: piping into tar would feed it a corrupt stream on a
+# mid-transfer retry; with a file the retry just re-downloads cleanly.
 curl $CURL_RETRY -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-${uv_arch}.tar.gz" \
-    | tar -xz -C "${tmpdir}"
+    -o "${tmpdir}/uv.tar.gz"
+tar -xz -C "${tmpdir}" -f "${tmpdir}/uv.tar.gz"
 install -m 0755 "${tmpdir}/uv-${uv_arch}/uv"  /usr/local/bin/uv
 install -m 0755 "${tmpdir}/uv-${uv_arch}/uvx" /usr/local/bin/uvx
 

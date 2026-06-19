@@ -22,8 +22,13 @@ if [ -x /usr/local/bin/agy ]; then
     exit 0
 fi
 
+# Download to a file before running it: piping `curl --retry` straight into
+# bash would re-emit from byte 0 on a mid-transfer retry, feeding bash a
+# corrupted/duplicated script. With a file, the retry just re-downloads cleanly.
+installer=$(mktemp)
+trap 'rm -f "${installer}"' EXIT
 # Retry transient network failures (e.g. 5xx) instead of aborting the build.
-curl --retry 5 --retry-connrefused --connect-timeout 30 -fsSL https://antigravity.google/cli/install.sh \
-    | bash -s -- --dir /usr/local/bin
+curl --retry 5 --retry-connrefused --connect-timeout 30 -fsSL https://antigravity.google/cli/install.sh -o "${installer}"
+bash "${installer}" --dir /usr/local/bin
 
 agy --version
