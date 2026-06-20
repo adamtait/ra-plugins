@@ -14,6 +14,9 @@ if ! command -v unzip >/dev/null 2>&1; then
     rm -rf /var/lib/apt/lists/*
 fi
 
+# Retry transient network failures (e.g. 5xx) instead of aborting the build.
+CURL_RETRY="--retry 5 --retry-connrefused --connect-timeout 30"
+
 arch=$(uname -m)
 case "${arch}" in
     x86_64)  aws_arch="x86_64" ;;
@@ -27,7 +30,7 @@ esac
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
 
-curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o "${tmpdir}/awscliv2.zip"
+curl $CURL_RETRY -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip" -o "${tmpdir}/awscliv2.zip"
 unzip -q "${tmpdir}/awscliv2.zip" -d "${tmpdir}"
 "${tmpdir}/aws/install"
 

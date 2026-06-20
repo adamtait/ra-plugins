@@ -7,8 +7,8 @@ if [ -x /usr/local/bin/uv ]; then
     exit 0
 fi
 
-UV_VERSION=$(curl -fsSL https://api.github.com/repos/astral-sh/uv/releases/latest \
-    | grep '"tag_name"' | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+# Retry transient network failures (e.g. GitHub 5xx) instead of aborting the build.
+CURL_RETRY="--retry 5 --retry-connrefused --connect-timeout 30"
 
 arch=$(uname -m)
 case "${arch}" in
@@ -23,8 +23,13 @@ esac
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
 
-curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_arch}.tar.gz" \
-    | tar -xz -C "${tmpdir}"
+# GitHub's releases/latest/download/ redirect resolves "latest" via the release
+# CDN, avoiding the rate-limited api.github.com endpoint entirely. Download to a
+# file before extracting: piping into tar would feed it a corrupt stream on a
+# mid-transfer retry; with a file the retry just re-downloads cleanly.
+curl $CURL_RETRY -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-${uv_arch}.tar.gz" \
+    -o "${tmpdir}/uv.tar.gz"
+tar -xz -C "${tmpdir}" -f "${tmpdir}/uv.tar.gz"
 install -m 0755 "${tmpdir}/uv-${uv_arch}/uv"  /usr/local/bin/uv
 install -m 0755 "${tmpdir}/uv-${uv_arch}/uvx" /usr/local/bin/uvx
 
