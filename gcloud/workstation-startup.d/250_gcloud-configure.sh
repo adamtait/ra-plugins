@@ -21,8 +21,9 @@ USER_HOME="/home/${USER_NAME}"
 GCLOUD_CONFIG_DIR="${USER_HOME}/.config/gcloud"
 CONFIG_FILE="${GCLOUD_CONFIG_DIR}/configurations/config_default"
 KEY_FILE="${GCLOUD_CONFIG_DIR}/ra-service-account.json"
+CRED_FILE="${GCLOUD_CONFIG_DIR}/ra-wif-cred-config.json"
 
-# Source fetched secrets (sets GCLOUD_SA_KEY_B64, etc.).
+# Source fetched secrets (sets GCLOUD_SA_KEY_B64, GCLOUD_WIF_CONFIG_B64, etc.).
 [ -r /run/ra/env ] && set -a && . /run/ra/env && set +a
 
 [ "${RA_PLUGIN_GCLOUD_ENABLED:-false}" = "true" ] || exit 0
@@ -109,41 +110,49 @@ log "wrote ${CONFIG_FILE} (project=${project:-unset}, region=${region:-unset}, z
 
 # --- Auth --------------------------------------------------------------------
 _clear_stale_state() {
-    # Drop any prior credential so switching keys/providers never leaves a stale
-    # GOOGLE_APPLICATION_CREDENTIALS or key file behind. Clearing through the
-    # helper drops the key from BOTH /etc/environment and /run/ra/env.
+    # Drop any prior credential so switching providers/keys never leaves a stale
+    # GOOGLE_APPLICATION_CREDENTIALS or credential file behind. Clearing through
+    # the helper drops the vars from BOTH /etc/environment and /run/ra/env.
     ra_env_unset GOOGLE_APPLICATION_CREDENTIALS
     ra_env_unset GCLOUD_SA_KEY_B64
-    rm -f "${KEY_FILE}"
+    ra_env_unset GCLOUD_WIF_CONFIG_B64
+    rm -f "${KEY_FILE}" "${CRED_FILE}"
+}
+
+# Decode a base64 credential blob into <dest> (0600, user-owned) and sanity-check
+# that it parses as JSON. Returns 0 when the file was written, 1 on decode
+# failure (base64 may decode garbage successfully, so a bad-JSON result only
+# warns — gcloud itself surfaces it on activation).
+_write_credential_file() {
+    local b64="$1" dest="$2"
+    if printf '%s' "${b64}" | base64 -d > "${dest}" 2>/dev/null; then
+        chown "${USER_NAME}:${USER_NAME}" "${dest}"
+        chmod 0600 "${dest}"
+        log "wrote ${dest}"
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "${dest}" 2>/dev/null \
+                || log "warning: ${dest} is not valid JSON; auth may fail"
+        elif command -v jq >/dev/null 2>&1; then
+            jq empty "${dest}" 2>/dev/null \
+                || log "warning: ${dest} is not valid JSON; auth may fail"
+        fi
+        return 0
+    fi
+    rm -f "${dest}"
+    return 1
 }
 
 _clear_stale_state
 
 case "${RA_PLUGIN_GCLOUD_AUTH_PROVIDER:-}" in
     service_account)
+        # Long-lived service-account JSON key → `gcloud auth activate-service-account`.
         if [[ -z "${GCLOUD_SA_KEY_B64:-}" ]]; then
             log "GCLOUD_SA_KEY_B64 not set; auth may fail"
-        elif printf '%s' "${GCLOUD_SA_KEY_B64}" | base64 -d > "${KEY_FILE}" 2>/dev/null; then
-            chown "${USER_NAME}:${USER_NAME}" "${KEY_FILE}"
-            chmod 0600 "${KEY_FILE}"
-            log "wrote ${KEY_FILE}"
-
-            # base64 may decode garbage successfully; verify the result parses as
-            # JSON when a parser is available. Skip silently if not — the decode
-            # succeeded and gcloud itself will surface bad JSON on activation.
-            if command -v python3 >/dev/null 2>&1; then
-                python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
-                    "${KEY_FILE}" 2>/dev/null \
-                    || log "warning: ${KEY_FILE} is not valid JSON; auth may fail"
-            elif command -v jq >/dev/null 2>&1; then
-                jq empty "${KEY_FILE}" 2>/dev/null \
-                    || log "warning: ${KEY_FILE} is not valid JSON; auth may fail"
-            fi
-
+        elif _write_credential_file "${GCLOUD_SA_KEY_B64}" "${KEY_FILE}"; then
             # Activate for the gcloud CLI itself, as the workstation user and
             # pinned to this config dir (matches the repo's `sudo -u user` idiom).
-            # Log a WARNING rather than aborting so a bad key doesn't take down
-            # the rest of boot.
+            # Log a WARNING rather than aborting so a bad key doesn't take down boot.
             if sudo -u "${USER_NAME}" env CLOUDSDK_CONFIG="${GCLOUD_CONFIG_DIR}" \
                 gcloud auth activate-service-account \
                 --key-file="${KEY_FILE}" ${project:+--project="${project}"} >/dev/null 2>&1; then
@@ -151,12 +160,29 @@ case "${RA_PLUGIN_GCLOUD_AUTH_PROVIDER:-}" in
             else
                 log "WARNING: gcloud auth activate-service-account failed; auth may fail"
             fi
-
             # Export for ADC / client libraries (google-cloud-* SDKs).
             ra_env_set GOOGLE_APPLICATION_CREDENTIALS "${KEY_FILE}"
         else
-            rm -f "${KEY_FILE}"
             log "failed to base64-decode GCLOUD_SA_KEY_B64; auth may fail"
+        fi
+        ;;
+    workload_identity)
+        # Workload Identity Federation credential configuration (external_account)
+        # → `gcloud auth login --cred-file`. No `--project` flag (auth login takes
+        # none; the project comes from the config we wrote above). The cred config
+        # is itself a valid ADC file, so it doubles as GOOGLE_APPLICATION_CREDENTIALS.
+        if [[ -z "${GCLOUD_WIF_CONFIG_B64:-}" ]]; then
+            log "GCLOUD_WIF_CONFIG_B64 not set; auth may fail"
+        elif _write_credential_file "${GCLOUD_WIF_CONFIG_B64}" "${CRED_FILE}"; then
+            if sudo -u "${USER_NAME}" env CLOUDSDK_CONFIG="${GCLOUD_CONFIG_DIR}" \
+                gcloud auth login --cred-file="${CRED_FILE}" >/dev/null 2>&1; then
+                log "logged in via workload identity federation cred file"
+            else
+                log "WARNING: gcloud auth login --cred-file failed; auth may fail"
+            fi
+            ra_env_set GOOGLE_APPLICATION_CREDENTIALS "${CRED_FILE}"
+        else
+            log "failed to base64-decode GCLOUD_WIF_CONFIG_B64; auth may fail"
         fi
         ;;
     host_identity)

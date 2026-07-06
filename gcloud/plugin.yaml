@@ -1,6 +1,6 @@
 name: gcloud
 version: "1.0.0"
-description: "Configures the Google Cloud CLI, authenticating via an injected service-account key or the workstation's own attached identity"
+description: "Configures the Google Cloud CLI, authenticating via a service-account key, a Workload Identity Federation config, or the workstation's own attached identity"
 config:
   - name: enabled
     type: bool
@@ -20,12 +20,19 @@ config:
     default: ""
 auth_providers:
   - name: service_account
-    description: "Service account key (JSON), base64-encoded"
+    description: "Service account key (JSON) — gcloud auth activate-service-account"
     secrets:
       - name: gcloud_sa_key
         env_var: GCLOUD_SA_KEY_B64
         description: "Service account JSON key, base64-encoded (base64 -w0 key.json)"
         default_secret_name: gcloud-sa-key
+  - name: workload_identity
+    description: "Workload Identity Federation credential config — gcloud auth login --cred-file"
+    secrets:
+      - name: gcloud_wif_config
+        env_var: GCLOUD_WIF_CONFIG_B64
+        description: "WIF credential configuration JSON, base64-encoded (base64 -w0 cred-config.json)"
+        default_secret_name: gcloud-wif-config
   - name: host_identity
     description: "Use the workstation's own attached service account (no key needed)"
     # No secrets: gcloud and ADC authenticate via the GCE metadata server using

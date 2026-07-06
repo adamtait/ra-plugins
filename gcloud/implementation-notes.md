@@ -6,16 +6,28 @@ building the `gcloud` plugin (modeled on `aws`, with the credential-handling sha
 
 ## Decisions not fully specified up front
 
-- **Two auth providers: `service_account` and `host_identity`.** `service_account` is
-  the faithful analog to `aws` (inject a static credential). `host_identity` was added
-  later on request: no secret — gcloud and ADC authenticate via the GCE metadata server
-  using the workstation's own attached service account. The remote-agent schema is
-  purpose-built for this: `AuthProvider.Secrets` is optional (a zero-secret provider is
-  valid; fileplugin.go only validates that the *selected* provider name exists), and
-  `AuthProvider.iam_roles` exists precisely to "grant the workstation service account
-  [roles] ... instead of a stored secret" (schema.go). The provider declares no
-  `iam_roles` by default — a YAML comment shows how to add them if a user needs extra
-  roles on the attached SA.
+- **Three auth providers: `service_account`, `workload_identity`, `host_identity`.**
+  - `service_account` — the faithful analog to `aws` (inject a static credential):
+    base64-encoded SA JSON key → `gcloud auth activate-service-account --key-file`.
+  - `workload_identity` — a Workload Identity Federation credential *configuration*
+    (`type: external_account`, produced by `gcloud iam workload-identity-pools
+    create-cred-config`) → `gcloud auth login --cred-file`. Same base64-blob transport
+    as the SA key. `auth login` takes no `--project` flag, so the project comes from the
+    config file we write. The WIF cred config is itself a valid ADC file, so it also
+    doubles as `GOOGLE_APPLICATION_CREDENTIALS` for client libraries.
+  - `host_identity` — no secret: gcloud and ADC authenticate via the GCE metadata
+    server using the workstation's own attached service account.
+  The remote-agent schema is purpose-built for the secret-less case:
+  `AuthProvider.Secrets` is optional (fileplugin.go only validates that the *selected*
+  provider name exists), and `AuthProvider.iam_roles` exists precisely to "grant the
+  workstation service account [roles] ... instead of a stored secret" (schema.go). The
+  `host_identity` provider declares no `iam_roles` by default — a YAML comment shows how
+  to add them.
+
+- **Shared decode helper.** `service_account` and `workload_identity` both base64-decode
+  a JSON blob into a 0600 file and JSON-validate it; that logic is factored into
+  `_write_credential_file` so the two branches differ only in the `gcloud` command they
+  run (`activate-service-account --key-file` vs `login --cred-file`).
 
 - **Base64 secret, not a `value_command`.** A GCP SA key is multi-line JSON and can't
   live in an env var directly, so it's stored base64-encoded (`GCLOUD_SA_KEY_B64`) and
