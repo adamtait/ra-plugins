@@ -60,16 +60,19 @@ building the `gcloud` plugin (modeled on `aws`, with the credential-handling sha
   `/run/ra/env`) contract identical.
 
 - **Two-layer auth activation.** Setting `GOOGLE_APPLICATION_CREDENTIALS` covers ADC
-  (client libraries), but the `gcloud` CLI itself uses its own credential store, so I
-  also run `gcloud auth activate-service-account` as the workstation user (the boot
-  script runs as root but the gcloud config/credential DB belongs to `user`).
-  Activation failure logs a `WARNING` and does **not** abort boot (per the
-  auth-hardening convention from commit `f78f98d`).
+  (client libraries), but the `gcloud` CLI itself uses its own credential store, so for
+  the credential-file providers we also run a CLI-side activation as the workstation
+  user (the boot script runs as root but the gcloud config/credential DB belongs to
+  `user`): `gcloud auth activate-service-account` for `service_account`, and
+  `gcloud auth login --cred-file` for `workload_identity`. Activation failure logs a
+  `WARNING` and does **not** abort boot (per the auth-hardening convention from commit
+  `f78f98d`).
 
-- **`_clear_stale_state`.** Mirrors `codex`: on every boot, `ra_env_unset`
-  `GOOGLE_APPLICATION_CREDENTIALS` and `GCLOUD_SA_KEY_B64` and remove the key file
-  before re-activating, so rotating the key or disabling the provider never leaves a
-  stale credential where a login shell still sources it.
+- **`_clear_stale_state`.** Mirrors `codex`: on every boot, before re-authenticating,
+  `ra_env_unset` `GOOGLE_APPLICATION_CREDENTIALS`, `GCLOUD_SA_KEY_B64`, and
+  `GCLOUD_WIF_CONFIG_B64`, and remove both credential files (`KEY_FILE`, `CRED_FILE`).
+  So rotating a key/config or switching providers never leaves a stale credential where
+  a login shell still sources it.
 
 ## No install hook (removed after confirming gcloud is a base-image guarantee)
 
@@ -96,10 +99,11 @@ re-adding.)
 
 ## Things to know / open questions
 
-- **Key file persists on disk** at `~/.config/gcloud/ra-service-account.json`
-  (`chmod 600`, owned by `user`). Required because `GOOGLE_APPLICATION_CREDENTIALS`
-  points at it. This matches the security posture of `aws` (static keys) and `codex`
-  (decoded `auth.json` on disk).
+- **Credential file persists on disk** — `~/.config/gcloud/ra-service-account.json`
+  (`service_account`) or `~/.config/gcloud/ra-wif-cred-config.json`
+  (`workload_identity`), each `chmod 0600`, owned by `user`. Required because
+  `GOOGLE_APPLICATION_CREDENTIALS` points at it. This matches the security posture of
+  `aws` (static keys) and `codex` (decoded `auth.json` on disk).
 
 - **No `profile.d/`** needed — the base image already has gcloud on PATH, and env vars
   go through the ra-env helper into `/etc/environment`.

@@ -7,13 +7,20 @@
 # Two responsibilities:
 #   1. Write the non-secret gcloud config (project / region / zone), overwriting
 #      on every boot — same idea as the aws plugin writing ~/.aws/config.
-#   2. For the service_account auth provider: decode the base64-encoded SA JSON
-#      key into a file, activate it for the gcloud CLI, and export
-#      GOOGLE_APPLICATION_CREDENTIALS so ADC / client libraries pick it up.
+#   2. Authenticate, per the selected auth provider:
+#        service_account   — decode a base64 SA JSON key, then
+#                            `gcloud auth activate-service-account`
+#        workload_identity — decode a base64 WIF credential config, then
+#                            `gcloud auth login --cred-file`
+#        host_identity     — no secret; use the workstation's own attached
+#                            service account via the GCE metadata server
+#      For the two credential-file providers we also export
+#      GOOGLE_APPLICATION_CREDENTIALS so ADC / client libraries use the same key.
 #
-# The SA key is base64-encoded (env var GCLOUD_SA_KEY_B64) because
-# /etc/environment and /run/ra/env can't carry multi-line values safely — the
-# same reason the codex plugin base64-encodes its auth.json.
+# The SA key / WIF config are base64-encoded (env vars GCLOUD_SA_KEY_B64 /
+# GCLOUD_WIF_CONFIG_B64) because /etc/environment and /run/ra/env can't carry
+# multi-line values safely — the same reason the codex plugin base64-encodes its
+# auth.json.
 set -euo pipefail
 
 USER_NAME="user"
@@ -104,7 +111,7 @@ chmod 0700 "${GCLOUD_CONFIG_DIR}"
 # leave active_config pointing at another named config, silently ignoring us.
 echo "default" > "${GCLOUD_CONFIG_DIR}/active_config"
 
-chmod 600 "${CONFIG_FILE}"
+chmod 600 "${CONFIG_FILE}" "${GCLOUD_CONFIG_DIR}/active_config"
 chown "${USER_NAME}:${USER_NAME}" "${CONFIG_FILE}" "${GCLOUD_CONFIG_DIR}/active_config"
 log "wrote ${CONFIG_FILE} (project=${project:-unset}, region=${region:-unset}, zone=${zone:-unset})"
 
