@@ -77,7 +77,13 @@ for pair in "project:${project}" "region:${region}" "zone:${zone}"; do
     [[ "${val}" =~ ^[a-z0-9-]*$ ]] || { log "invalid ${key}: ${val}"; exit 1; }
 done
 
-mkdir -p "${GCLOUD_CONFIG_DIR}/configurations"
+# Create the config tree owned by the workstation user (mirrors how the github
+# plugin uses `sudo -u user mkdir -p`, so the intermediate ~/.config isn't left
+# root-owned). 0700 on the gcloud dir also shields the SA key file written inside
+# it below — other local users can't traverse in even during the brief window
+# before the key's own chmod 0600 lands.
+sudo -u "${USER_NAME}" mkdir -p "${GCLOUD_CONFIG_DIR}/configurations"
+chmod 0700 "${GCLOUD_CONFIG_DIR}"
 
 # Build the INI config, emitting only the sections/keys that have a value.
 {
@@ -92,8 +98,13 @@ mkdir -p "${GCLOUD_CONFIG_DIR}/configurations"
     fi
 } > "${CONFIG_FILE}"
 
+# Force "default" to be the active configuration so the file we just wrote is the
+# one gcloud actually reads — a base image (or a prior boot) could otherwise
+# leave active_config pointing at another named config, silently ignoring us.
+echo "default" > "${GCLOUD_CONFIG_DIR}/active_config"
+
 chmod 600 "${CONFIG_FILE}"
-chown -R "${USER_NAME}:${USER_NAME}" "${GCLOUD_CONFIG_DIR}"
+chown "${USER_NAME}:${USER_NAME}" "${CONFIG_FILE}" "${GCLOUD_CONFIG_DIR}/active_config"
 log "wrote ${CONFIG_FILE} (project=${project:-unset}, region=${region:-unset}, zone=${zone:-unset})"
 
 # --- Auth --------------------------------------------------------------------
@@ -129,10 +140,12 @@ case "${RA_PLUGIN_GCLOUD_AUTH_PROVIDER:-}" in
                     || log "warning: ${KEY_FILE} is not valid JSON; auth may fail"
             fi
 
-            # Activate for the gcloud CLI itself (as the workstation user, whose
-            # config dir this is). Log a WARNING rather than aborting so a bad key
-            # doesn't take down the rest of boot.
-            if runuser -u "${USER_NAME}" -- gcloud auth activate-service-account \
+            # Activate for the gcloud CLI itself, as the workstation user and
+            # pinned to this config dir (matches the repo's `sudo -u user` idiom).
+            # Log a WARNING rather than aborting so a bad key doesn't take down
+            # the rest of boot.
+            if sudo -u "${USER_NAME}" env CLOUDSDK_CONFIG="${GCLOUD_CONFIG_DIR}" \
+                gcloud auth activate-service-account \
                 --key-file="${KEY_FILE}" ${project:+--project="${project}"} >/dev/null 2>&1; then
                 log "activated service account for gcloud CLI"
             else
