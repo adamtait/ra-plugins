@@ -53,23 +53,28 @@ building the `gcloud` plugin (modeled on `aws`, with the credential-handling sha
   before re-activating, so rotating the key or disabling the provider never leaves a
   stale credential where a login shell still sources it.
 
-## Install hook tradeoffs
+## No install hook (removed after confirming gcloud is a base-image guarantee)
 
-- **Idempotent, skips if `gcloud` exists.** gcloud appears preinstalled in the base
-  image (the `github` plugin and the core call `gcloud` directly), so in practice the
-  guard makes this a no-op. Kept it anyway to (a) mirror the `aws` structure and (b)
-  stay safe on any base image lacking gcloud. If gcloud is guaranteed present, the whole
-  `Dockerfile.d/` hook could be dropped.
+The plugin originally shipped an idempotent `Dockerfile.d/100_gcloud-install.sh` that
+installed the Cloud SDK unless `gcloud` was already on PATH — mirroring the `aws`
+plugin's structure. It was **removed** once confirmed redundant:
 
-- **Rapid channel, unpinned.** Installs the latest from the `rapid` channel tarball,
-  matching `aws`'s "always latest, no version pinned by design" stance. Downloads to a
-  temp file before `tar` (never pipe `curl --retry` into `tar`) and uses the standard
-  `CURL_RETRY` flags.
+- These are **Google Cloud Workstations**, and gcloud is preinstalled in the code-oss
+  base image. `claude-sync/Dockerfile.d/110_claude-sync-tools.sh` states it outright
+  ("curl and gcloud are guaranteed by the Cloud Workstations code-oss base image") and
+  deliberately does **not** install gcloud — it only soft-warns. `github` and
+  `claude-sync` both call `gcloud` at runtime with no install. Google's docs confirm the
+  predefined base images bundle the gcloud CLI.
+- So the install hook was dead code in practice and diverged from the repo's own
+  convention for this dependency. Dropping it collapses the plugin to `plugin.yaml` +
+  the configure script.
+- Safe to drop: the configure script degrades gracefully if gcloud were ever missing —
+  the `sudo -u user gcloud auth …` call only logs a `WARNING` (doesn't abort boot), and
+  `GOOGLE_APPLICATION_CREDENTIALS` is still exported for ADC/client libraries.
 
-- **arch mapping.** Google's tarballs use `x86_64` and `arm` (not `aarch64`); mapped
-  `uname -m` accordingly. Symlinks `gcloud`, `gsutil`, `bq` into `/usr/local/bin` so
-  they're on PATH without a `profile.d/` entry (same as `aws` landing in
-  `/usr/local/bin`).
+(The install hook it referenced used Google's tarball naming `x86_64`/`arm` — not
+`aarch64` — for the record, in case a future base image ever drops gcloud and it needs
+re-adding.)
 
 ## Things to know / open questions
 
@@ -78,8 +83,8 @@ building the `gcloud` plugin (modeled on `aws`, with the credential-handling sha
   points at it. This matches the security posture of `aws` (static keys) and `codex`
   (decoded `auth.json` on disk).
 
-- **No `profile.d/`** needed — install symlinks handle PATH, and env vars go through
-  the ra-env helper into `/etc/environment`.
+- **No `profile.d/`** needed — the base image already has gcloud on PATH, and env vars
+  go through the ra-env helper into `/etc/environment`.
 
 - The **end-to-end path (`ra plugin install` → `ra create`)** can't be exercised here
   (no `ra` CLI / GCP project in this environment); verified statically instead

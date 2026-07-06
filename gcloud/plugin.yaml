@@ -1,6 +1,6 @@
 name: gcloud
 version: "1.0.0"
-description: "Installs the Google Cloud CLI and activates a service-account credential from GCP Secret Manager at boot"
+description: "Configures the Google Cloud CLI and activates a service-account credential from GCP Secret Manager at boot"
 config:
   - name: enabled
     type: bool
