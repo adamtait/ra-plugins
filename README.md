@@ -15,6 +15,7 @@ Each plugin is a self-contained directory with a `plugin.yaml` manifest and opti
 | [claude-sync](./claude-sync/) | Syncs `~/.claude/` across workstations via a GCS bucket (see its [README](./claude-sync/README.md)) |
 | [codex](./codex/) | OpenAI Codex CLI — supports ChatGPT OAuth or API key |
 | [et](./et/) | Eternal Terminal server — auto-reconnecting connections via `ra connect --et` |
+| [gcloud](./gcloud/) | Google Cloud CLI with a service-account credential injected from GCP Secret Manager at boot |
 | [github](./github/) | GitHub CLI + PAT-based git credential helper; optionally clones repos at first boot |
 | [marimo](./marimo/) | Reactive Python notebook server — auto-starts the edit server at boot |
 | [terraform](./terraform/) | HashiCorp Terraform CLI |

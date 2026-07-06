@@ -1,0 +1,28 @@
+name: gcloud
+version: "1.0.0"
+description: "Installs the Google Cloud CLI and activates a service-account credential from GCP Secret Manager at boot"
+config:
+  - name: enabled
+    type: bool
+    description: "Enable Google Cloud CLI plugin?"
+    default: false
+  - name: project
+    type: string
+    description: "Default GCP project ID"
+    default: ""
+  - name: region
+    type: string
+    description: "Default compute region (e.g. us-central1)"
+    default: ""
+  - name: zone
+    type: string
+    description: "Default compute zone (e.g. us-central1-a)"
+    default: ""
+auth_providers:
+  - name: service_account
+    description: "Service account key (JSON), base64-encoded"
+    secrets:
+      - name: gcloud_sa_key
+        env_var: GCLOUD_SA_KEY_B64
+        description: "Service account JSON key, base64-encoded (base64 -w0 key.json)"
+        default_secret_name: gcloud-sa-key
