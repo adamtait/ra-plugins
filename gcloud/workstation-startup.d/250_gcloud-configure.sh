@@ -159,6 +159,20 @@ case "${RA_PLUGIN_GCLOUD_AUTH_PROVIDER:-}" in
             log "failed to base64-decode GCLOUD_SA_KEY_B64; auth may fail"
         fi
         ;;
+    host_identity)
+        # No key to install — gcloud and ADC authenticate via the GCE metadata
+        # server using the workstation's own attached service account.
+        # _clear_stale_state already removed any prior key file and unset
+        # GOOGLE_APPLICATION_CREDENTIALS, so ADC falls back to the metadata SA.
+        # The home disk persists across boots on Cloud Workstations, so also
+        # revoke any account a prior service_account boot activated — otherwise
+        # the gcloud CLI would stay pinned to that (now-removed) key instead of
+        # falling back to the metadata identity. `revoke --all` exits non-zero
+        # when there's nothing to revoke, hence `|| true`.
+        sudo -u "${USER_NAME}" env CLOUDSDK_CONFIG="${GCLOUD_CONFIG_DIR}" \
+            gcloud auth revoke --all >/dev/null 2>&1 || true
+        log "using workstation host identity (attached service account)"
+        ;;
     "")
         log "no auth provider selected; wrote config only"
         ;;

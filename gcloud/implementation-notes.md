@@ -6,10 +6,16 @@ building the `gcloud` plugin (modeled on `aws`, with the credential-handling sha
 
 ## Decisions not fully specified up front
 
-- **Auth model = service-account key.** The clarifying questions timed out (user away),
-  so I went with the most faithful analog to `aws` (which injects static access keys):
-  a service-account JSON key. Host-identity-only (no secret, just `gcloud config`) was
-  the alternative and remains an easy follow-up as a second auth provider if wanted.
+- **Two auth providers: `service_account` and `host_identity`.** `service_account` is
+  the faithful analog to `aws` (inject a static credential). `host_identity` was added
+  later on request: no secret — gcloud and ADC authenticate via the GCE metadata server
+  using the workstation's own attached service account. The remote-agent schema is
+  purpose-built for this: `AuthProvider.Secrets` is optional (a zero-secret provider is
+  valid; fileplugin.go only validates that the *selected* provider name exists), and
+  `AuthProvider.iam_roles` exists precisely to "grant the workstation service account
+  [roles] ... instead of a stored secret" (schema.go). The provider declares no
+  `iam_roles` by default — a YAML comment shows how to add them if a user needs extra
+  roles on the attached SA.
 
 - **Base64 secret, not a `value_command`.** A GCP SA key is multi-line JSON and can't
   live in an env var directly, so it's stored base64-encoded (`GCLOUD_SA_KEY_B64`) and
@@ -85,6 +91,14 @@ re-adding.)
 
 - **No `profile.d/`** needed — the base image already has gcloud on PATH, and env vars
   go through the ra-env helper into `/etc/environment`.
+
+- **`host_identity` revokes stale gcloud creds.** Cloud Workstations persist `/home`
+  (so `~/.config/gcloud` survives across boots). Switching `service_account` →
+  `host_identity` therefore needs to clear the account a prior boot activated, or the
+  gcloud CLI would stay pinned to that now-removed key instead of falling back to the
+  metadata identity. The `host_identity` branch runs `gcloud auth revoke --all`
+  (`|| true`, since it errors when there's nothing to revoke) to force that fallback.
+  ADC is already handled by `_clear_stale_state` unsetting `GOOGLE_APPLICATION_CREDENTIALS`.
 
 - The **end-to-end path (`ra plugin install` → `ra create`)** can't be exercised here
   (no `ra` CLI / GCP project in this environment); verified statically instead

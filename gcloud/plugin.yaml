@@ -1,6 +1,6 @@
 name: gcloud
 version: "1.0.0"
-description: "Configures the Google Cloud CLI and activates a service-account credential from GCP Secret Manager at boot"
+description: "Configures the Google Cloud CLI, authenticating via an injected service-account key or the workstation's own attached identity"
 config:
   - name: enabled
     type: bool
@@ -26,3 +26,10 @@ auth_providers:
         env_var: GCLOUD_SA_KEY_B64
         description: "Service account JSON key, base64-encoded (base64 -w0 key.json)"
         default_secret_name: gcloud-sa-key
+  - name: host_identity
+    description: "Use the workstation's own attached service account (no key needed)"
+    # No secrets: gcloud and ADC authenticate via the GCE metadata server using
+    # the workstation's service account. To grant that service account extra
+    # project-level roles at `ra create` time, add them here, e.g.:
+    #   iam_roles:
+    #     - roles/aiplatform.user
