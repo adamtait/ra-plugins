@@ -52,13 +52,4 @@ tmux_args+=( -c "${start_directory}" )
 # Run tmux as the workstation user — tmux sockets are per-UID; a root-owned
 # socket would be inaccessible when the user SSHes in.
 sudo -u "${USER_NAME}" tmux "${tmux_args[@]}"
-
-# Keep the tmux server alive across transient zero-session states. tmux defaults
-# to `exit-empty on`, which reaps the whole server the moment its last session
-# closes — e.g. if the boot session's pane shell exits — leaving a stale socket
-# and a confusing "no server running" state with no warm session. `new-session
-# -A` on connect still recreates the session, so this is defensive: it keeps the
-# server (and its socket) valid rather than dead-but-present. See issue #14.
-sudo -u "${USER_NAME}" tmux set-option -g exit-empty off
-
 echo "[tmux-start] created session '${session_name}'${start_directory:+ in ${start_directory}}."
