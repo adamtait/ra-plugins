@@ -20,6 +20,12 @@
 #   that installs zsh — with no dependence on startup ordering or timing. The
 #   installer is idempotent and a no-op until zsh is present, so firing on every
 #   apt run is harmless.
+#
+#   Assumption: zsh reaches the workstation via apt/apt-get (the ra dotfiles path
+#   does). A bare `dpkg -i`, a snap, or a pre-baked/from-source zsh would not fire
+#   Post-Invoke; the once-at-build run (step 4) covers zsh already present in the
+#   image, but a runtime non-apt install would be missed — the per-user
+#   ~/.zprofile hook remains the backstop there.
 set -euo pipefail
 
 SNIPPET=/etc/ra/tmux/zsh-autoattach.zsh
@@ -64,16 +70,23 @@ cat > "${INSTALLER}" <<'RA_INSTALLER_EOF'
 # Idempotently wire the ra tmux zsh auto-attach snippet into /etc/zsh/zlogin.
 # Invoked from a dpkg Post-Invoke hook and once at image build. No-op unless zsh
 # is installed and the hook is not already present.
+#
+# We append to /etc/zsh/zlogin, a zsh-common dpkg conffile (zsh has no global
+# zlogin.d drop-in). The only side effect is that an in-place `apt upgrade` of
+# zsh-common may show a conffile prompt (noninteractive keeps our version) —
+# acceptable given the fresh-root-each-boot model. The guard greps for the
+# load-bearing `source` line (not the header comment), and the block is written
+# as a single printf, so a half-written block is repaired on the next run rather
+# than matching the marker forever.
 set -eu
 ZLOGIN=/etc/zsh/zlogin
 command -v zsh >/dev/null 2>&1 || exit 0
 [ -d /etc/zsh ] || exit 0
-grep -qsF 'ra tmux plugin: zsh auto-attach' "${ZLOGIN}" 2>/dev/null && exit 0
-{
-  printf '\n# >>> ra tmux plugin: zsh auto-attach (managed) >>>\n'
-  printf '[ -r /etc/ra/tmux/zsh-autoattach.zsh ] && source /etc/ra/tmux/zsh-autoattach.zsh\n'
-  printf '# <<< ra tmux plugin: zsh auto-attach (managed) <<<\n'
-} >> "${ZLOGIN}"
+grep -qsF 'source /etc/ra/tmux/zsh-autoattach.zsh' "${ZLOGIN}" 2>/dev/null && exit 0
+printf '\n%s\n%s\n%s\n' \
+  '# >>> ra tmux plugin: zsh auto-attach (managed) >>>' \
+  '[ -r /etc/ra/tmux/zsh-autoattach.zsh ] && source /etc/ra/tmux/zsh-autoattach.zsh' \
+  '# <<< ra tmux plugin: zsh auto-attach (managed) <<<' >> "${ZLOGIN}"
 RA_INSTALLER_EOF
 chmod 0755 "${INSTALLER}"
 
