@@ -1,6 +1,18 @@
 name: tmux
 version: "1.0.0"
 description: "Installs tmux and starts a persistent named session at boot; auto-attaches login shells"
+# login-command: what `ra connect` (and `--et`) runs in place of the login shell,
+# so the session lands directly in tmux regardless of which login shell the image
+# uses — shell-agnostic, unlike the per-shell profile.d/zlogin auto-attach hooks
+# (which remain for non-ra entry points like the browser IDE terminal). `ra`
+# substitutes {session_name} from config and validates that value is shell-safe.
+#
+# The `sh -c` wrapper carries a TERM fallback: this command runs before any shell,
+# so there is no profile.d hook to guard TERM, and tmux refuses to attach when the
+# client's $TERM has no terminfo on the workstation (e.g. xterm-ghostty/xterm-kitty,
+# which ncurses-term does not ship). Wrapping in `sh -c` keeps it shell-agnostic —
+# whatever the login shell, it just execs sh, which interprets the rest.
+login-command: "sh -c 'infocmp -- \"$TERM\" >/dev/null 2>&1 || export TERM=xterm-256color; exec tmux new-session -A -s {session_name}'"
 config:
   - name: enabled
     type: bool
