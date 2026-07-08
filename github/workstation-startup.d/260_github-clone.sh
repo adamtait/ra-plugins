@@ -76,14 +76,27 @@ clone_one() {
     # Extract repo name: last path component, strip .git suffix.
     local repo_name="${REPO_URL##*/}"
     repo_name="${repo_name%.git}"
-    if [[ -z "${repo_name}" ]]; then
-        echo "[github-clone] WARNING: could not determine repo name from ${REPO_URL}; skipping." >>"${CLONE_LOG}"
-        return 0
-    fi
+    # Reject anything that isn't a single safe path component. Empty, ".", ".."
+    # or a name containing "/" would make clone_target escape WORKSPACE_DIR
+    # (e.g. ".." -> /home/user), turning the rm -rf below into a destructive
+    # operation on the wrong directory.
+    case "${repo_name}" in
+        ""|.|..|*/*)
+            echo "[github-clone] WARNING: refusing unsafe repo name '${repo_name}' from ${REPO_URL}; skipping." >>"${CLONE_LOG}"
+            return 0
+            ;;
+    esac
 
     local clone_target="${WORKSPACE_DIR}/${repo_name}"
     if [[ -d "${clone_target}/.git" ]]; then
         echo "[github-clone] ${clone_target} already cloned; skipping." >>"${CLONE_LOG}"
+        return 0
+    fi
+    # Never clobber pre-existing content: if something already occupies the
+    # target that isn't our git checkout, leave it untouched. Otherwise a failed
+    # clone's rm -rf (below) would delete user data the plugin didn't create.
+    if [[ -e "${clone_target}" ]]; then
+        echo "[github-clone] WARNING: ${clone_target} exists but is not a git repo; leaving it untouched." >>"${CLONE_LOG}"
         return 0
     fi
 
@@ -94,7 +107,10 @@ clone_one() {
             return 0
         fi
         echo "[github-clone] clone of ${REPO_URL} failed (attempt ${attempt}/${CLONE_MAX_ATTEMPTS})" >>"${CLONE_LOG}"
-        # Remove any partial checkout so the retry (and next boot) starts clean.
+        # Remove the partial checkout so the retry (and next boot) starts clean.
+        # Safe to rm: the guards above guarantee clone_target is a single path
+        # component under WORKSPACE_DIR that did not pre-exist, so whatever is
+        # here now was created by this attempt.
         rm -rf "${clone_target}"
         attempt=$((attempt + 1))
         [ "${attempt}" -le "${CLONE_MAX_ATTEMPTS}" ] && sleep "${CLONE_RETRY_DELAY}"
