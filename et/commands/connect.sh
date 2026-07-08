@@ -46,11 +46,17 @@ while [ "$DATA_PORT" = "$BOOT_PORT" ]; do DATA_PORT="$(free_port)"; done
 # Supervised tunnel: `ra tunnel` is a single foreground (unsupervised) tunnel, so
 # wrap it in a respawn loop — if it drops, et's own reconnect finds a fresh one.
 supervise() {
-	local lport="$1" rport="$2" label="$3"
+	local lport="$1" rport="$2" label="$3" delay=1 start
 	while true; do
+		start=$SECONDS
 		ra tunnel "${lport}:${rport}" "$RA_WORKSTATION" "${loc[@]}" >/dev/null 2>&1 || true
-		echo "et: ${label} tunnel dropped; reconnecting..." >&2
-		sleep 0.5
+		if [ $((SECONDS - start)) -ge 2 ]; then
+			delay=1 # ran a while ⇒ a real drop; reconnect promptly
+		else
+			delay=$((delay < 30 ? delay * 2 : 30)) # fast-fail (e.g. `ra` missing) ⇒ capped backoff
+		fi
+		echo "et: ${label} tunnel dropped; reconnecting in ${delay}s..." >&2
+		sleep "$delay"
 	done
 }
 supervise "$BOOT_PORT" "$REMOTE_SSH_PORT" bootstrap &
@@ -91,13 +97,11 @@ args=(-k 3 --ssh-option "Port=${BOOT_PORT}")
 ident="${HOME}/.ssh/google_compute_engine"
 [ -r "$ident" ] && args+=(--ssh-option "IdentityFile=${ident}")
 args+=(--ssh-option StrictHostKeyChecking=no --ssh-option UserKnownHostsFile=/dev/null -p "${DATA_PORT}")
+# A non-empty RA_LOGIN_COMMAND runs in place of the login shell (matching
+# `ra connect`). et takes a remote command via -c/--command (there is no trailing
+# positional for it — the only positional is the host), and exits when it returns.
+[ -n "${RA_LOGIN_COMMAND:-}" ] && args+=(--command "$RA_LOGIN_COMMAND")
 
 echo "Connecting to ${RA_WORKSTATION} via Eternal Terminal (auto-reconnecting)..." >&2
 # Foreground (not exec) so the EXIT trap tears the tunnels down when et returns.
-# A non-empty RA_LOGIN_COMMAND is forwarded as the remote command (in place of
-# the login shell), matching `ra connect`.
-if [ -n "${RA_LOGIN_COMMAND:-}" ]; then
-	et "${args[@]}" "${USER_NAME}@localhost" "$RA_LOGIN_COMMAND"
-else
-	et "${args[@]}" "${USER_NAME}@localhost"
-fi
+et "${args[@]}" "${USER_NAME}@localhost"
