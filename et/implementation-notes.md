@@ -88,6 +88,20 @@ teardown (real, recurring cost) worth more than hardening a non-TTY invocation
 the user never performs. If a pure-0 is ever wanted without `set -m`, teardown
 must switch to explicit process-group / `pkill -f "ra tunnel <port>:"` killing.
 
+## Review fix (applied)
+
+**Finding (low severity, applied):** the port-picker's `|| { exit 1; }` only
+caught `read` *failure*, not a successful read of partial/garbage output. If
+`python3` ever emitted a single token, `read` returns 0 with `DATA_PORT` empty
+and a later `-p ""` / `ra tunnel :2022` fails confusingly. Closed with a
+numeric-validation guard after the read (`[[ "$BOOT_PORT" =~ ^[0-9]+$ && ... ]]`),
+neutralizing `set -e` on the read with `|| true` first. Happy path re-verified
+(two distinct numeric ports; connect proceeds past the guard).
+
+Rest of the review was clean: no correctness bugs, no CLAUDE.md violations
+(ra-plugins has none), and the change is a net simplification (drops the RANDOM
+loop and the distinct-port dedup, now guaranteed by simultaneous bind).
+
 ## Verification status
 
 - [x] `bash -n` clean on all 3 `connect.sh`; all 3 byte-identical.
