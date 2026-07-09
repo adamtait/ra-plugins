@@ -57,7 +57,9 @@ fi
 
 # Idempotency: a previous boot (or a previous run of this script) may have left
 # the server running. The "serve" anchor avoids false matches on unrelated
-# commands that happen to contain "claude-science".
+# commands that happen to contain "claude-science". NOTE: this anchor must stay
+# in sync with the launch subcommand at the bottom of this script — if the real
+# beta CLI verb differs from "serve", update BOTH or dedup silently breaks.
 if pgrep -u "${USER_NAME}" -f "claude-science serve" >/dev/null 2>&1; then
     echo "[claude-science-start] claude-science already running; skipping."
     exit 0
