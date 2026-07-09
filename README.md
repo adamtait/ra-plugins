@@ -12,6 +12,7 @@ Each plugin is a self-contained directory with a `plugin.yaml` manifest and opti
 | [aws](./aws/) | AWS CLI v2 with credentials injected from GCP Secret Manager at boot |
 | [babashka](./babashka/) | Fast-starting native Clojure interpreter (`bb`) |
 | [claude](./claude/) | Claude Code — installs and configures the CLI; supports OAuth or API key |
+| [claude-science](./claude-science/) | Claude Science — Anthropic's AI workbench for scientists; auto-starts the workbench server on a tunneled port |
 | [claude-sync](./claude-sync/) | Syncs `~/.claude/` across workstations via a GCS bucket (see its [README](./claude-sync/README.md)) |
 | [codex](./codex/) | OpenAI Codex CLI — supports ChatGPT OAuth or API key |
 | [et](./et/) | Eternal Terminal server — auto-reconnecting connections via `ra plugin et connect` |
