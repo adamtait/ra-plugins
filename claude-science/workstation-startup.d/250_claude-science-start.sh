@@ -2,9 +2,14 @@
 # claude-science plugin — start the Claude Science workbench server at boot.
 #
 # Runs as root from /etc/workstation-startup.d/, after 200_remote-agent-setup.sh
-# has sourced secrets/config into /run/ra/env and 250_claude-science-setup.sh has
-# exported the OAuth token. Drops privileges to the workstation user and detaches
-# the server with setsid so it survives the startup script's exit.
+# has sourced config into /run/ra/env. Drops privileges to the workstation user
+# and detaches the server with setsid so it survives the startup script's exit.
+#
+# Auth: Claude Science does NOT read an env-var bearer token — it persists an
+# interactive-OAuth session under ~/.claude-science/ (an encrypted .oauth-tokens
+# tree + a co-located encryption.key). This plugin therefore injects no secret;
+# the user signs in once through the tunneled web UI. That session lives under
+# ~/.claude-science/, which is not persisted across fresh workstations by default.
 #
 # Idempotency: pgrep on the server command line — running the script twice on the
 # same boot is a no-op on the second run.
@@ -77,13 +82,12 @@ fi
 #     survives this script's exit and is immune to any SIGHUP from teardown.
 #   - env HOME=... PATH=... — /etc/workstation-startup.d/ runs with a near-empty
 #     environment; without HOME the server writes config/state under / or /root.
-#     CLAUDE_CODE_OAUTH_TOKEN is passed through explicitly so the server inherits
-#     the auth token exported by 250_claude-science-setup.sh.
+#     HOME must be the user's so the app finds/creates its ~/.claude-science/ auth
+#     tree there.
 #   - exec claude-science replaces bash so there's no extra shell PID in pgrep.
 #   - </dev/null detaches stdin so the daemon has no controlling tty.
 sudo -u "${USER_NAME}" \
     env HOME="${USER_HOME}" PATH="/usr/local/bin:/usr/bin:/bin" \
-    CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}" \
     setsid --fork bash -c \
     "cd '${working_directory}' && exec claude-science serve --headless --host 0.0.0.0 --port ${port} >> '${LOG_FILE}' 2>&1" \
     </dev/null

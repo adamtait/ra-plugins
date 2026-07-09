@@ -11,11 +11,9 @@ config:
     type: string
     description: "Directory where Claude Science stores projects (leave blank for home directory)"
     default: ""
-secrets:
-  - name: claude_science_oauth
-    env_var: CLAUDE_CODE_OAUTH_TOKEN
-    description: "Claude subscription OAuth token from claude.ai/settings (Pro/Max/Team/Enterprise)"
-    default_secret_name: claude-code-oauth-token
 post_install_message: |
-  Claude Science will start a headless workbench server on port 2719.
-  Reach it from your machine with:  ra tunnel 2719  then open http://localhost:2719
+  Claude Science starts a headless workbench server on port 2719. Reach it with:
+    ra tunnel 2719   then open http://localhost:2719
+  Sign in once through that web UI (requires a Pro/Max/Team/Enterprise plan).
+  Auth persists under ~/.claude-science/; since workstation home is not persisted
+  by default, you will sign in again on each freshly created workstation.
