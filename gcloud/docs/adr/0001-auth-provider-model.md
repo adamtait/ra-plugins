@@ -44,8 +44,8 @@ is already present in the base image and the workstation has its own attached se
   `configurations/config_default` directly (idempotent overwrite), mirroring how `aws` writes
   `~/.aws/config`. This keeps the non-secret path deterministic and avoids invoking `gcloud` for it.
   Only sections/keys with a non-empty value are emitted. The active config is pinned by writing
-  `active_config = default`, so the generated file is the one gcloud actually reads even if the base
-  image left another named config active.
+  `default` into gcloud's `active_config` file, so the generated config is the one gcloud actually
+  reads even if the base image left another named config active.
 - **Two-layer activation.** Exporting `GOOGLE_APPLICATION_CREDENTIALS` covers ADC (client libraries),
   but the gcloud CLI keeps its own credential store, so for the credential-file providers the plugin
   also runs a CLI-side activation **as the workstation user** (the boot script runs as root, but the

@@ -5,7 +5,7 @@
 # Reads from the standard ra contract:
 #   GCP_PROJECT_ID
 #   RA_PLUGIN_GITHUB_ENABLED
-#   RA_SECRET_GITHUB_PAT_NAME  (gcp secret name, set by buildContainerEnv)
+#   RA_SECRET_GITHUB_PAT_NAME  (gcp secret name, injected by `ra create`)
 set -euo pipefail
 
 GIT_HELPER_PATH="/usr/local/bin/git-credential-gcp-secret"

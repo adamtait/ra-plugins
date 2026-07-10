@@ -35,7 +35,7 @@ loc=(--project "$RA_PROJECT" --cluster "$RA_CLUSTER" --config "$RA_CONFIG")
 # driven in a tight loop concurrently with the backgrounded 'ra tunnel' jobs
 # below, triggers a fatal SIGABRT in bash on macOS. Keeping every local-port
 # probe inside a single python3 process avoids that fork/probe storm (same
-# reasoning in wait_port; see remote-agent docs/adr/0015).
+# reasoning in wait_port; see docs/adr/0001-python3-local-port-helpers.md).
 read -r BOOT_PORT DATA_PORT < <(python3 -c '
 import socket
 a = socket.socket(); a.bind(("127.0.0.1", 0))
