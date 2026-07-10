@@ -25,6 +25,20 @@ CLONE_LOG="/var/log/ra-github-clone.log"
 CLONE_MAX_ATTEMPTS="${RA_GITHUB_CLONE_MAX_ATTEMPTS:-3}"
 CLONE_RETRY_DELAY="${RA_GITHUB_CLONE_RETRY_DELAY:-3}"
 
+# Concurrency cap for the bounded worker pool below. Clones are both network-
+# and CPU-bound (index-pack delta resolution + checkout), so unbounded fan-out
+# thrashes and can trip GitHub secondary rate limits once the repo list is
+# large. Default to the core count; override with RA_GITHUB_CLONE_JOBS.
+CLONE_JOBS="${RA_GITHUB_CLONE_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+case "${CLONE_JOBS}" in ''|*[!0-9]*) CLONE_JOBS=4 ;; esac
+[ "${CLONE_JOBS}" -lt 1 ] && CLONE_JOBS=1
+
+# Optional shallow clone (opt-in). Biggest single per-repo lever for many/large
+# repos: skipping full history cuts both transfer and the CPU-bound delta
+# resolution. Off by default because it changes checkout semantics (truncated
+# history, single branch). Set RA_GITHUB_CLONE_DEPTH=1 (or N) to enable.
+CLONE_DEPTH="${RA_GITHUB_CLONE_DEPTH:-}"
+
 [ -r /run/ra/env ] && set -a && . /run/ra/env && set +a
 
 [ -e "${FIRST_BOOT_MARKER}" ] && exit 0
@@ -57,8 +71,10 @@ fi
 sudo -u "${USER_NAME}" mkdir -p "${WORKSPACE_DIR}"
 
 # clone_one REPO_URL — normalize, skip-if-present, clone with retries.
-# Returns non-zero only after exhausting all attempts. Runs backgrounded, so
-# per-repo output is written to CLONE_LOG (interleaving on stderr is avoided).
+# Returns non-zero and records the URL under FAIL_DIR only after exhausting all
+# attempts. Runs backgrounded, so per-repo output is written to CLONE_LOG
+# (interleaving on stderr is avoided) and the parent tallies FAIL_DIR rather
+# than relying on per-PID wait status (which the pool's `wait -n` may reap).
 clone_one() {
     local REPO_URL="$1"
 
@@ -100,9 +116,16 @@ clone_one() {
         return 0
     fi
 
+    # Assemble git args, honoring the optional shallow-clone knob.
+    local -a clone_args=(clone)
+    if [ -n "${CLONE_DEPTH}" ]; then
+        clone_args+=(--depth "${CLONE_DEPTH}" --single-branch)
+    fi
+    clone_args+=("${REPO_URL}" "${clone_target}")
+
     local attempt=1
     while [ "${attempt}" -le "${CLONE_MAX_ATTEMPTS}" ]; do
-        if sudo -u "${USER_NAME}" git clone "${REPO_URL}" "${clone_target}" >>"${CLONE_LOG}" 2>&1; then
+        if sudo -u "${USER_NAME}" git "${clone_args[@]}" >>"${CLONE_LOG}" 2>&1; then
             echo "[github-clone] cloned ${REPO_URL} -> ${clone_target}" >>"${CLONE_LOG}"
             return 0
         fi
@@ -113,33 +136,50 @@ clone_one() {
         # here now was created by this attempt.
         rm -rf "${clone_target}"
         attempt=$((attempt + 1))
-        [ "${attempt}" -le "${CLONE_MAX_ATTEMPTS}" ] && sleep "${CLONE_RETRY_DELAY}"
+        if [ "${attempt}" -le "${CLONE_MAX_ATTEMPTS}" ]; then
+            # Sleep base..2*base seconds. The jitter de-synchronizes retries so
+            # a shared cause (network blip, rate-limit) doesn't make every repo
+            # retry in lockstep. RANDOM is reseeded per subshell, so concurrent
+            # workers draw different values.
+            sleep "$(( CLONE_RETRY_DELAY + (RANDOM % (CLONE_RETRY_DELAY + 1)) ))"
+        fi
     done
     echo "[github-clone] ERROR: giving up on ${REPO_URL} after ${CLONE_MAX_ATTEMPTS} attempts" >>"${CLONE_LOG}"
+    # Record the permanent failure for the parent to tally (BASHPID is unique
+    # per background worker, so writes don't collide).
+    printf '%s\n' "${REPO_URL}" >"${FAIL_DIR}/${BASHPID}"
     return 1
 }
 
 IFS='|' read -r -a _ra_repo_urls <<<"${RA_PLUGIN_GITHUB_REPO_URLS:-}"
 
-# Launch clones concurrently, then wait — first-boot wall-clock is the slowest
-# single repo rather than the sum of all of them.
-declare -a _ra_pids=()
-declare -a _ra_pid_urls=()
+# Directory where workers drop a marker per permanently-failed repo. Tallied
+# after the pool drains; cleaned up on exit.
+FAIL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ra-github-clone.XXXXXX")"
+trap 'rm -rf "${FAIL_DIR}"; mark_done' EXIT
+
+# Bounded worker pool: at most CLONE_JOBS clones run at once. Mental model is
+# "CLONE_JOBS workers draining the queue of URLs" — wall-clock stays predictable
+# and resource use bounded whether there are 3 repos or 300. When the cap is
+# reached, `wait -n` blocks until one worker finishes, freeing a slot.
 for REPO_URL in "${_ra_repo_urls[@]}"; do
     [ -z "${REPO_URL}" ] && continue
+    while [ "$(jobs -rp | wc -l)" -ge "${CLONE_JOBS}" ]; do
+        wait -n 2>/dev/null || true
+    done
     clone_one "${REPO_URL}" &
-    _ra_pids+=("$!")
-    _ra_pid_urls+=("${REPO_URL}")
 done
+wait  # drain the remaining workers
 
+# Tally failures from the marker directory (see clone_one). Avoids per-PID wait
+# bookkeeping, which is unreliable once `wait -n` has already reaped jobs.
 failed=0
-for i in "${!_ra_pids[@]}"; do
-    if ! wait "${_ra_pids[$i]}"; then
-        failed=$((failed + 1))
-        log "clone failed: ${_ra_pid_urls[$i]}"
-    fi
+for _f in "${FAIL_DIR}"/*; do
+    [ -e "${_f}" ] || continue  # no matches -> literal glob; skip
+    failed=$((failed + 1))
+    log "clone failed: $(cat "${_f}")"
 done
-unset _ra_repo_urls _ra_pids _ra_pid_urls
+unset _ra_repo_urls _f
 
 if [ "${failed}" -gt 0 ]; then
     log "first-boot clone finished with ${failed} failed repo(s); see ${CLONE_LOG}"
