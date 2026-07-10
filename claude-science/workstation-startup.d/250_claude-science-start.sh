@@ -17,14 +17,18 @@
 # Logging: appends to ~/.claude-science.log (no rotation; acceptable for a
 # single-user workstation).
 #
-# Launch line: `claude-science serve --no-browser --host <addr> --port <n>`,
+# Launch line: `claude-science serve --no-browser --host 127.0.0.1 --port <n>`,
 # confirmed against `claude-science serve --help` (v0.1.18-dev). Notes:
 #   - --no-browser is the remote/no-display flag (there is NO --headless flag;
 #     passing one makes the CLI print usage and exit without binding the port).
+#   - --host 127.0.0.1 (the app default) keeps the UI on loopback. `ra tunnel`
+#     reaches loopback-bound ports (verified), so there is no need to expose it on
+#     0.0.0.0 — the app's own help recommends exactly this (loopback + a tunnel).
 #   - the sandbox needs `socat` on PATH; the Dockerfile.d install step provides it.
 #   - serve also opens a second "sandbox content" port (default: port+1) for HTML
-#     previews Claude generates. Only the main port is tunneled by port-for-tunnel;
-#     forward port+1 separately (`ra tunnel <port+1>`) if you need those previews.
+#     previews Claude generates, bound to loopback. Only the main port is tunneled
+#     by port-for-tunnel; forward port+1 separately (`ra tunnel <port+1>`) if you
+#     need those previews.
 set -euo pipefail
 
 USER_NAME="user"
@@ -67,8 +71,8 @@ fi
 # Idempotency: a previous boot (or a previous run of this script) may have left
 # the server running. The "serve" anchor avoids false matches on unrelated
 # commands that happen to contain "claude-science". NOTE: this anchor must stay
-# in sync with the launch subcommand at the bottom of this script — if the real
-# beta CLI verb differs from "serve", update BOTH or dedup silently breaks.
+# in sync with the launch subcommand at the bottom of this script — if the "serve"
+# verb ever changes, update BOTH or dedup silently breaks.
 if pgrep -u "${USER_NAME}" -f "claude-science serve" >/dev/null 2>&1; then
     echo "[claude-science-start] claude-science already running; skipping."
     exit 0
@@ -93,7 +97,7 @@ fi
 sudo -u "${USER_NAME}" \
     env HOME="${USER_HOME}" PATH="/usr/local/bin:/usr/bin:/bin" \
     setsid --fork bash -c \
-    "cd '${working_directory}' && exec claude-science serve --no-browser --host 0.0.0.0 --port ${port} >> '${LOG_FILE}' 2>&1" \
+    "cd '${working_directory}' && exec claude-science serve --no-browser --host 127.0.0.1 --port ${port} >> '${LOG_FILE}' 2>&1" \
     </dev/null
 
 echo "[claude-science-start] started claude-science on port ${port} in ${working_directory}"

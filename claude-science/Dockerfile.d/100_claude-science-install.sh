@@ -30,11 +30,9 @@ INSTALL_PATH="/usr/local/bin/claude-science"
 # `claude-science serve` aborts at startup with
 #   fatal: Error: socat is required for Linux sandbox networking ...
 # and never binds its port. Install it at build time (the app suggests exactly
-# this: `apt-get install socat`).
-export DEBIAN_FRONTEND=noninteractive
+# this: `apt-get install socat`) — same apt idiom as the et/tmux/github plugins.
 apt-get update
 apt-get install -y --no-install-recommends socat
-rm -rf /var/lib/apt/lists/*
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
