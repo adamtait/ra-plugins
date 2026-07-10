@@ -30,9 +30,8 @@ Excluded (deliberately — local to each workstation):
 
 ## Architecture
 
-See [`SPEC.md`](./SPEC.md) for the full design and
-[`implementation-notes.md`](./implementation-notes.md) for the running
-log of decisions and deviations.
+See the [Architecture Decision Records](./docs/adr/) for the full design and
+the reasoning behind the key decisions.
 
 ```
 Workstation A ──┐                              ┌── Workstation C
@@ -191,7 +190,7 @@ gcloud storage rm "gs://<bucket>/claude-sync/_manifest/<old-ws-id>.json"
 > keep the boot `gcloud storage ls workstations/` listing small. With the
 > pull already capping how many namespaces it *reads*, this is only worth
 > adding if the raw `ls` itself slows down (hundreds+ of entries). See
-> SPEC.md "Load reduction" for the design sketch.
+> [ADR 0004](./docs/adr/0004-load-reduction.md) for the design sketch.
 
 ## ⚠️ Security: transcripts contain whatever Claude saw
 

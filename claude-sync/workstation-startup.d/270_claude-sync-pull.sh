@@ -8,7 +8,7 @@
 # All claude-sync data lives under the claude-sync/ prefix inside the
 # bucket so other plugins can share the same bucket without collisions.
 #
-# Merge model (see SPEC.md "ADR 2026-06-07"):
+# Merge model (see docs/adr/0002-merge-based-sync.md):
 #   * projects/, todos/, plans/, session-env/ — namespace-scoped, UUID-
 #     named. Staged into a tmpdir, then copied into the live tree with
 #     `cp -an` so newer local files win over the GCS copy.
@@ -191,7 +191,7 @@ PLUGIN_PREFIX="gs://${BUCKET}/claude-sync"
 # grew unbounded. We rank candidate namespaces by their manifest's
 # last_push_at_epoch, then pull only those active within MAX_AGE_DAYS AND
 # cap to the MAX_NAMESPACES most recent. Both are configurable via plugin
-# config; defaults below match SPEC.md.
+# config; defaults below match docs/adr/0004-load-reduction.md.
 MAX_AGE_DAYS="${RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_AGE_DAYS:-30}"
 MAX_NAMESPACES="${RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_NAMESPACES:-15}"
 case "${MAX_AGE_DAYS}" in *[!0-9]*|"") MAX_AGE_DAYS=30 ;; esac
