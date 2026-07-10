@@ -59,7 +59,7 @@ Plugin scripts mirror where they land in the image (`/etc/...`):
 |---|---|---|
 | `Dockerfile.d/` | Docker image build time | Installing packages, downloading binaries |
 | `workstation-startup.d/` | Every container boot, after `200_remote-agent-setup.sh` | Auth setup, credential helpers, first-boot data clones |
-| `profile.d/` | Every login shell | PATH additions, shell aliases |
+| `profile.d/` | Every **bash / POSIX-`sh`** login shell | Shell aliases, login-shell setup. **Not sourced by zsh** — for PATH additions see [Adding to PATH](#adding-to-path-across-login-shells) |
 
 ### Script naming conventions
 
@@ -68,6 +68,40 @@ Filenames follow `<NNN>_<plugin-name>-<purpose>.sh`. Numbers control execution o
 - **`Dockerfile.d/`** — use `100`–`199`
 - **`workstation-startup.d/`** — use `250`+. The core `200_remote-agent-setup.sh` runs first; plugin scripts must be ≥ 250 to guarantee secrets are available.
 - **`profile.d/`** — no strict convention; existing plugins use `00`–`50`. Lower numbers run first.
+
+### Adding to PATH across login shells
+
+Files in `profile.d/` land in `/etc/profile.d/` and are sourced only by **bash and
+other POSIX-`sh`-family login shells** (via `/etc/profile`). **zsh does not source
+`/etc/profile.d/*`** — it reads `/etc/zsh/{zshenv,zprofile,zshrc,zlogin}`. So a plain
+`export PATH=…` dropped in `profile.d/` silently vanishes whenever the workstation's
+default login shell is zsh (e.g. a dotfiles step runs `chsh`).
+
+If your plugin installs into `/usr/local/bin` (as most do), it's already on PATH and
+you need none of this. If it installs somewhere else, register that directory with the
+shell-agnostic PATH mechanism instead of writing to `profile.d/` directly:
+
+- **`/etc/ra/path.d/<key>.sh`** — drop one guarded POSIX fragment per directory
+  (keyed by the directory, so plugins sharing a prefix converge on one entry):
+  ```sh
+  case ":$PATH:" in
+    *:/opt/my-tool/bin:*) ;;
+    *) export PATH="/opt/my-tool/bin:$PATH" ;;
+  esac
+  ```
+- **`/etc/ra/load-path.sh`** sources every fragment; the per-shell entrypoints
+  (`/etc/profile.d/00-ra-path.sh` for POSIX shells, a managed block in
+  `/etc/zsh/zshenv` for zsh) each just source the loader.
+
+Ship this wiring from a `Dockerfile.d/110_<plugin>-shell-path.sh` build script — copy
+the one in [`claude`](./claude/Dockerfile.d/110_claude-shell-path.sh) (it's generic
+and idempotent, so multiple PATH-adding plugins converge rather than collide) and
+change only the fragment's directory. The zsh entrypoint is installed via a dpkg
+`Post-Invoke` hook because zsh is installed *at boot* by an external dotfiles step and
+`/etc/zsh/zshenv` is a `zsh-common` conffile — the same reason the
+[`tmux`](./tmux/Dockerfile.d/110_tmux-zsh-autoattach.sh) plugin uses that mechanism.
+See [`claude/implementation-notes.md`](./claude/implementation-notes.md) for the full
+rationale.
 
 ### plugin.yaml schema
 
