@@ -1,6 +1,6 @@
 # ra-plugins
 
-A collection of plugins for the [`remote-agent`](https://github.com/adamtait/remote-agent) (ra) CLI — a tool for creating and managing ephemeral cloud workstations.
+A collection of plugins for the `remote-agent` (`ra`) CLI — a tool for creating and managing ephemeral cloud workstations.
 
 Each plugin is a self-contained directory with a `plugin.yaml` manifest and optional scripts that run at image build time, workstation startup, and shell login.
 
@@ -32,7 +32,7 @@ ra plugin install ./path/to/plugin
 
 `ra` prompts for config values and credentials, stores secrets in GCP Secret Manager, and applies the plugin to all subsequent `ra create` calls.
 
-See the [remote-agent docs](https://github.com/adamtait/remote-agent) for full CLI reference.
+See the `remote-agent` (`ra`) CLI documentation for full CLI reference.
 
 ---
 

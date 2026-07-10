@@ -1,6 +1,10 @@
 name: marimo
 version: "1.0.0"
 description: "Installs marimo (reactive Python notebook) and auto-starts the edit server at boot"
+# Security note: the edit server is started with `--host 0.0.0.0 --no-token`, i.e. it
+# binds all interfaces with no auth token. This is safe only because access is gated by
+# the workstation's port tunnel (below) on a single-user workstation — the port is not
+# exposed publicly. Do not expose port 2718 directly to an untrusted network.
 port-for-tunnel: 2718
 config:
   - name: enabled
