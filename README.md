@@ -59,7 +59,7 @@ Plugin scripts mirror where they land in the image (`/etc/...`):
 |---|---|---|
 | `Dockerfile.d/` | Docker image build time | Installing packages, downloading binaries |
 | `workstation-startup.d/` | Every container boot, after `200_remote-agent-setup.sh` | Auth setup, credential helpers, first-boot data clones |
-| `profile.d/` | Every **bash / POSIX-`sh`** login shell | Shell aliases, login-shell setup. **Not sourced by zsh** — for PATH additions see [Adding to PATH](#adding-to-path-across-login-shells) |
+| `profile.d/` | Every **bash / POSIX-`sh`** login shell | Shell aliases, login-shell setup. **Not sourced by zsh** — don't put PATH here; see [Putting a CLI on PATH](#putting-a-cli-on-path) |
 
 ### Script naming conventions
 
@@ -69,44 +69,21 @@ Filenames follow `<NNN>_<plugin-name>-<purpose>.sh`. Numbers control execution o
 - **`workstation-startup.d/`** — use `250`+. The core `200_remote-agent-setup.sh` runs first; plugin scripts must be ≥ 250 to guarantee secrets are available.
 - **`profile.d/`** — no strict convention; existing plugins use `00`–`50`. Lower numbers run first.
 
-### Adding to PATH across login shells
+### Putting a CLI on PATH
 
-Files in `profile.d/` land in `/etc/profile.d/` and are sourced only by **bash and
-other POSIX-`sh`-family login shells** (via `/etc/profile`). **zsh does not source
-`/etc/profile.d/*`** — it reads `/etc/zsh/{zshenv,zprofile,zshrc,zlogin}`. So a plain
-`export PATH=…` dropped in `profile.d/` silently vanishes whenever the workstation's
-default login shell is zsh (e.g. a dotfiles step runs `chsh`).
+Install executables into **`/usr/local/bin`** — it's on the baseline PATH of every
+shell (bash, zsh, …) and every invocation type, so nothing needs to touch shell
+config. Do **not** add a directory to PATH via `profile.d/`: those files are not
+sourced by zsh, so the entry silently disappears whenever the default login shell
+is zsh. Most plugins already install straight into `/usr/local/bin` at build time
+(e.g. `aws`, `terraform`, `uv`, `antigravity`).
 
-If your plugin installs into `/usr/local/bin` (as most do), it's already on PATH and
-you need none of this. If it installs somewhere else, register that directory with the
-shell-agnostic PATH mechanism instead of writing to `profile.d/` directly:
-
-- **`/etc/ra/path.d/<key>.sh`** — drop one guarded POSIX fragment per directory
-  (keyed by the directory, so plugins sharing a prefix converge on one entry):
-  ```sh
-  case ":$PATH:" in
-    *:/opt/my-tool/bin:*) ;;
-    *) export PATH="/opt/my-tool/bin:$PATH" ;;
-  esac
-  ```
-- **`/etc/ra/load-path.sh`** sources every fragment; the per-shell entrypoints
-  (`/etc/profile.d/00-ra-path.sh` for POSIX shells, a managed block in
-  `/etc/zsh/zshenv` for zsh) each just source the loader.
-
-Keep fragments to a guarded `export PATH` and nothing else: under zsh they're
-sourced inside an anonymous function (so `null_glob` can be scoped), where only
-`export`ed assignments propagate to the shell — a plain variable, `alias`, or
-`typeset` in a fragment would not behave the same as under POSIX `sh`.
-
-Ship this wiring from a `Dockerfile.d/110_<plugin>-shell-path.sh` build script — copy
-the one in [`claude`](./claude/Dockerfile.d/110_claude-shell-path.sh) (it's generic
-and idempotent, so multiple PATH-adding plugins converge rather than collide) and
-change only the fragment's directory. The zsh entrypoint is installed via a dpkg
-`Post-Invoke` hook because zsh is installed *at boot* by an external dotfiles step and
-`/etc/zsh/zshenv` is a `zsh-common` conffile — the same reason the
-[`tmux`](./tmux/Dockerfile.d/110_tmux-zsh-autoattach.sh) plugin uses that mechanism.
-See [`claude/implementation-notes.md`](./claude/implementation-notes.md) for the full
-rationale.
+If a plugin installs somewhere else at runtime (e.g. `claude`/`codex` do a
+first-boot `npm install -g` into the persistent `~/.npm-global`), bake a
+build-time symlink into the image instead — see
+[`claude/Dockerfile.d/110_claude-path-link.sh`](./claude/Dockerfile.d/110_claude-path-link.sh).
+The rationale, the persistence model, and the alternatives considered are recorded
+in [ADR 0002](./docs/adr/0002-plugin-clis-on-path-across-login-shells.md).
 
 ### plugin.yaml schema
 
