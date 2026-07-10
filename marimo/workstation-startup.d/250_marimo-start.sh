@@ -75,7 +75,7 @@ fi
 sudo -u "${USER_NAME}" \
     env HOME="${USER_HOME}" PATH="/usr/local/bin:/usr/bin:/bin" \
     setsid --fork bash -c \
-    "cd '${working_directory}' && exec marimo edit --headless --host 0.0.0.0 --port ${port} --no-token >> '${MARIMO_LOG}' 2>&1" \
+    "cd '${working_directory}' && exec marimo edit --headless --host 127.0.0.1 --port ${port} --no-token >> '${MARIMO_LOG}' 2>&1" \
     </dev/null
 
 echo "[marimo-start] started marimo edit on port ${port} in ${working_directory}"
