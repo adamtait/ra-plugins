@@ -14,6 +14,8 @@ config:
 post_install_message: |
   Claude Science starts a headless workbench server on port 2719. Reach it with:
     ra tunnel 2719   then open http://localhost:2719
+  For HTML previews Claude generates, also forward the sandbox-content port (2720):
+    ra tunnel 2720   (in a second terminal)
   Sign in once through that web UI (requires a Pro/Max/Team/Enterprise plan).
   Auth persists under ~/.claude-science/; since workstation home is not persisted
   by default, you will sign in again on each freshly created workstation.

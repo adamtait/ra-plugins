@@ -17,10 +17,14 @@
 # Logging: appends to ~/.claude-science.log (no rotation; acceptable for a
 # single-user workstation).
 #
-# NOTE (beta): the launch subcommand/flags below are a best-effort assumption for
-# the Claude Science beta. Confirm the real invocation with `claude-science --help`
-# on a running workstation; this launch line is the only thing that changes if the
-# CLI differs.
+# Launch line: `claude-science serve --no-browser --host <addr> --port <n>`,
+# confirmed against `claude-science serve --help` (v0.1.18-dev). Notes:
+#   - --no-browser is the remote/no-display flag (there is NO --headless flag;
+#     passing one makes the CLI print usage and exit without binding the port).
+#   - the sandbox needs `socat` on PATH; the Dockerfile.d install step provides it.
+#   - serve also opens a second "sandbox content" port (default: port+1) for HTML
+#     previews Claude generates. Only the main port is tunneled by port-for-tunnel;
+#     forward port+1 separately (`ra tunnel <port+1>`) if you need those previews.
 set -euo pipefail
 
 USER_NAME="user"
@@ -89,7 +93,7 @@ fi
 sudo -u "${USER_NAME}" \
     env HOME="${USER_HOME}" PATH="/usr/local/bin:/usr/bin:/bin" \
     setsid --fork bash -c \
-    "cd '${working_directory}' && exec claude-science serve --headless --host 0.0.0.0 --port ${port} >> '${LOG_FILE}' 2>&1" \
+    "cd '${working_directory}' && exec claude-science serve --no-browser --host 0.0.0.0 --port ${port} >> '${LOG_FILE}' 2>&1" \
     </dev/null
 
 echo "[claude-science-start] started claude-science on port ${port} in ${working_directory}"

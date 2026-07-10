@@ -26,6 +26,16 @@ fi
 DOWNLOAD_URL="https://downloads.claude.ai/claude-science/latest/linux-x64"
 INSTALL_PATH="/usr/local/bin/claude-science"
 
+# socat is a hard runtime dependency of the Linux sandbox networking. Without it,
+# `claude-science serve` aborts at startup with
+#   fatal: Error: socat is required for Linux sandbox networking ...
+# and never binds its port. Install it at build time (the app suggests exactly
+# this: `apt-get install socat`).
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends socat
+rm -rf /var/lib/apt/lists/*
+
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
 
