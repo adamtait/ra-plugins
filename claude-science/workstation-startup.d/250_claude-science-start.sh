@@ -24,7 +24,8 @@
 #   - --host 127.0.0.1 (the app default) keeps the UI on loopback. `ra tunnel`
 #     reaches loopback-bound ports (verified), so there is no need to expose it on
 #     0.0.0.0 — the app's own help recommends exactly this (loopback + a tunnel).
-#   - the sandbox needs `socat` on PATH; the Dockerfile.d install step provides it.
+#   - the sandbox needs `socat` and `bubblewrap` (bwrap) on the (restricted) boot
+#     PATH; the Dockerfile.d install step apt-installs both into /usr/bin.
 #   - serve also opens a second "sandbox content" port (default: port+1) for HTML
 #     previews Claude generates, bound to loopback. Only the main port is tunneled
 #     by port-for-tunnel; forward port+1 separately (`ra tunnel <port+1>`) if you

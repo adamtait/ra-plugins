@@ -26,13 +26,16 @@ fi
 DOWNLOAD_URL="https://downloads.claude.ai/claude-science/latest/linux-x64"
 INSTALL_PATH="/usr/local/bin/claude-science"
 
-# socat is a hard runtime dependency of the Linux sandbox networking. Without it,
-# `claude-science serve` aborts at startup with
-#   fatal: Error: socat is required for Linux sandbox networking ...
-# and never binds its port. Install it at build time (the app suggests exactly
-# this: `apt-get install socat`) — same apt idiom as the et/tmux/github plugins.
+# The Linux sandbox has two hard runtime dependencies that must be on the boot
+# script's PATH — which is a restricted /usr/local/bin:/usr/bin:/bin and notably
+# EXCLUDES linuxbrew, so a `bwrap` under /home/linuxbrew is not enough:
+#   - socat      — else serve aborts "socat is required for Linux sandbox networking"
+#   - bubblewrap — else serve aborts "Sandbox unavailable: bwrap not found on PATH"
+# apt installs both into /usr/bin (on the boot PATH); the app suggests exactly
+# `apt-get install socat` / `apt-get install bubblewrap`. Same apt idiom as the
+# et/tmux/github plugins.
 apt-get update
-apt-get install -y --no-install-recommends socat
+apt-get install -y --no-install-recommends socat bubblewrap
 
 tmpdir=$(mktemp -d)
 trap 'rm -rf "${tmpdir}"' EXIT
