@@ -78,10 +78,10 @@ sourced by zsh, so the entry silently disappears whenever the default login shel
 is zsh. Most plugins already install straight into `/usr/local/bin` at build time
 (e.g. `aws`, `terraform`, `uv`, `antigravity`).
 
-If a plugin installs somewhere else at runtime (e.g. `claude`/`codex` do a
-first-boot `npm install -g` into the persistent `~/.npm-global`), bake a
-build-time symlink into the image instead — see
-[`claude/Dockerfile.d/110_claude-path-link.sh`](./claude/Dockerfile.d/110_claude-path-link.sh).
+If a plugin installs somewhere else at runtime (e.g. `claude` does a first-boot
+`npm install -g` into the persistent `~/.npm-global`; `codex` runs its standalone
+installer into `~/.local/bin`), bake a build-time symlink into the image instead —
+see [`claude/Dockerfile.d/110_claude-path-link.sh`](./claude/Dockerfile.d/110_claude-path-link.sh).
 The rationale, the persistence model, and the alternatives considered are recorded
 in [ADR 0002](./docs/adr/0002-plugin-clis-on-path-across-login-shells.md).
 
