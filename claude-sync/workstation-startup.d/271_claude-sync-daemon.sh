@@ -45,7 +45,7 @@ cat > "${LOOP_PATH}" <<'LOOP_EOF'
 # seconds. All data lives under the claude-sync/ prefix so other plugins
 # can share the same bucket without collisions.
 #
-# Push integrity (see SPEC.md "ADR 2026-06-07"):
+# Push integrity (see docs/adr/0002-merge-based-sync.md):
 #   * history.jsonl is sanitized (torn/invalid lines dropped) before
 #     upload so a line caught mid-append never ships.
 #   * .claude.json is JSON-validated before upload; a torn read is
