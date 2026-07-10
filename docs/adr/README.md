@@ -11,6 +11,7 @@ Each ADR follows a lightweight *Context / Decision / Consequences* form.
 ## Cross-cutting ADRs
 
 - [0001 — Plugin boot-time environment and auth-hardening conventions](./0001-plugin-boot-environment-and-auth-conventions.md)
+- [0002 — Exposing plugin CLIs on PATH across login shells](./0002-plugin-clis-on-path-across-login-shells.md)
 
 ## Plugin-specific ADRs
 

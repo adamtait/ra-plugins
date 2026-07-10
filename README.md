@@ -59,7 +59,7 @@ Plugin scripts mirror where they land in the image (`/etc/...`):
 |---|---|---|
 | `Dockerfile.d/` | Docker image build time | Installing packages, downloading binaries |
 | `workstation-startup.d/` | Every container boot, after `200_remote-agent-setup.sh` | Auth setup, credential helpers, first-boot data clones |
-| `profile.d/` | Every login shell | PATH additions, shell aliases |
+| `profile.d/` | Every **bash / POSIX-`sh`** login shell | Shell aliases, login-shell setup. **Not sourced by zsh** — don't put PATH here; see [Putting a CLI on PATH](#putting-a-cli-on-path) |
 
 ### Script naming conventions
 
@@ -68,6 +68,22 @@ Filenames follow `<NNN>_<plugin-name>-<purpose>.sh`. Numbers control execution o
 - **`Dockerfile.d/`** — use `100`–`199`
 - **`workstation-startup.d/`** — use `250`+. The core `200_remote-agent-setup.sh` runs first; plugin scripts must be ≥ 250 to guarantee secrets are available.
 - **`profile.d/`** — no strict convention; existing plugins use `00`–`50`. Lower numbers run first.
+
+### Putting a CLI on PATH
+
+Install executables into **`/usr/local/bin`** — it's on the baseline PATH of every
+shell (bash, zsh, …) and every invocation type, so nothing needs to touch shell
+config. Do **not** add a directory to PATH via `profile.d/`: those files are not
+sourced by zsh, so the entry silently disappears whenever the default login shell
+is zsh. Most plugins already install straight into `/usr/local/bin` at build time
+(e.g. `aws`, `terraform`, `uv`, `antigravity`).
+
+If a plugin installs somewhere else at runtime (e.g. `claude`/`codex` do a
+first-boot `npm install -g` into the persistent `~/.npm-global`), bake a
+build-time symlink into the image instead — see
+[`claude/Dockerfile.d/110_claude-path-link.sh`](./claude/Dockerfile.d/110_claude-path-link.sh).
+The rationale, the persistence model, and the alternatives considered are recorded
+in [ADR 0002](./docs/adr/0002-plugin-clis-on-path-across-login-shells.md).
 
 ### plugin.yaml schema
 
