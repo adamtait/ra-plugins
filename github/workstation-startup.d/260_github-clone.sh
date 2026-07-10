@@ -28,8 +28,16 @@ CLONE_RETRY_DELAY="${RA_GITHUB_CLONE_RETRY_DELAY:-3}"
 # Concurrency cap for the bounded worker pool below. Clones are both network-
 # and CPU-bound (index-pack delta resolution + checkout), so unbounded fan-out
 # thrashes and can trip GitHub secondary rate limits once the repo list is
-# large. Default to the core count; override with RA_GITHUB_CLONE_JOBS.
-CLONE_JOBS="${RA_GITHUB_CLONE_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+# large. Default to the core count, but ceiling it at 8: GitHub's secondary
+# limits are per-account/IP (not per-core), so more than a handful of parallel
+# clones mostly buys rate-limit risk rather than throughput. Override (up or
+# down) with RA_GITHUB_CLONE_JOBS.
+CLONE_JOBS="${RA_GITHUB_CLONE_JOBS:-}"
+if [ -z "${CLONE_JOBS}" ]; then
+    _cores="$(nproc 2>/dev/null || echo 4)"
+    if [ "${_cores}" -gt 8 ]; then CLONE_JOBS=8; else CLONE_JOBS="${_cores}"; fi
+    unset _cores
+fi
 case "${CLONE_JOBS}" in ''|*[!0-9]*) CLONE_JOBS=4 ;; esac
 [ "${CLONE_JOBS}" -lt 1 ] && CLONE_JOBS=1
 
@@ -77,6 +85,7 @@ sudo -u "${USER_NAME}" mkdir -p "${WORKSPACE_DIR}"
 # than relying on per-PID wait status (which the pool's `wait -n` may reap).
 clone_one() {
     local REPO_URL="$1"
+    local marker_id="$2"  # unique per repo; names this worker's failure marker
 
     # Normalize SSH GitHub URLs to HTTPS — workstation has only HTTPS creds (PAT
     # via the credential helper) and no SSH keys / known_hosts.
@@ -145,9 +154,10 @@ clone_one() {
         fi
     done
     echo "[github-clone] ERROR: giving up on ${REPO_URL} after ${CLONE_MAX_ATTEMPTS} attempts" >>"${CLONE_LOG}"
-    # Record the permanent failure for the parent to tally (BASHPID is unique
-    # per background worker, so writes don't collide).
-    printf '%s\n' "${REPO_URL}" >"${FAIL_DIR}/${BASHPID}"
+    # Record the permanent failure for the parent to tally. marker_id is a
+    # per-repo index (not a PID), so markers never collide even if the OS
+    # recycles a finished worker's PID later in the run.
+    printf '%s\n' "${REPO_URL}" >"${FAIL_DIR}/${marker_id}"
     return 1
 }
 
@@ -162,12 +172,14 @@ trap 'rm -rf "${FAIL_DIR}"; mark_done' EXIT
 # "CLONE_JOBS workers draining the queue of URLs" — wall-clock stays predictable
 # and resource use bounded whether there are 3 repos or 300. When the cap is
 # reached, `wait -n` blocks until one worker finishes, freeing a slot.
+_ra_idx=0
 for REPO_URL in "${_ra_repo_urls[@]}"; do
     [ -z "${REPO_URL}" ] && continue
     while [ "$(jobs -rp | wc -l)" -ge "${CLONE_JOBS}" ]; do
         wait -n 2>/dev/null || true
     done
-    clone_one "${REPO_URL}" &
+    _ra_idx=$((_ra_idx + 1))
+    clone_one "${REPO_URL}" "${_ra_idx}" &
 done
 wait  # drain the remaining workers
 
@@ -179,7 +191,7 @@ for _f in "${FAIL_DIR}"/*; do
     failed=$((failed + 1))
     log "clone failed: $(cat "${_f}")"
 done
-unset _ra_repo_urls _f
+unset _ra_repo_urls _f _ra_idx
 
 if [ "${failed}" -gt 0 ]; then
     log "first-boot clone finished with ${failed} failed repo(s); see ${CLONE_LOG}"
