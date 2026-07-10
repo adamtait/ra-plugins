@@ -1,0 +1,21 @@
+name: claude-science
+version: "1.0.0"
+description: "Installs Claude Science (Anthropic's AI workbench for scientists) and auto-starts the headless workbench server at boot"
+port-for-tunnel: 2719
+config:
+  - name: enabled
+    type: bool
+    description: "Install Claude Science and auto-start the workbench server?"
+    default: false
+  - name: working_directory
+    type: string
+    description: "Directory where Claude Science stores projects (leave blank for home directory)"
+    default: ""
+post_install_message: |
+  Claude Science starts a headless workbench server on port 2719. Reach it with:
+    ra tunnel 2719   then open http://localhost:2719
+  For HTML previews Claude generates, also forward the sandbox-content port (2720):
+    ra tunnel 2720   (in a second terminal)
+  Sign in once through that web UI (requires a Pro/Max/Team/Enterprise plan).
+  Auth persists under ~/.claude-science/; since workstation home is not persisted
+  by default, you will sign in again on each freshly created workstation.
