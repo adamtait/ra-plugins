@@ -93,6 +93,11 @@ shell-agnostic PATH mechanism instead of writing to `profile.d/` directly:
   (`/etc/profile.d/00-ra-path.sh` for POSIX shells, a managed block in
   `/etc/zsh/zshenv` for zsh) each just source the loader.
 
+Keep fragments to a guarded `export PATH` and nothing else: under zsh they're
+sourced inside an anonymous function (so `null_glob` can be scoped), where only
+`export`ed assignments propagate to the shell — a plain variable, `alias`, or
+`typeset` in a fragment would not behave the same as under POSIX `sh`.
+
 Ship this wiring from a `Dockerfile.d/110_<plugin>-shell-path.sh` build script — copy
 the one in [`claude`](./claude/Dockerfile.d/110_claude-shell-path.sh) (it's generic
 and idempotent, so multiple PATH-adding plugins converge rather than collide) and
