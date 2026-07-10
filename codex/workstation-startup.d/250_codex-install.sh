@@ -2,8 +2,8 @@
 # Codex plugin — first-boot install via the standalone installer.
 #
 # Runs as part of /etc/workstation-startup.d/, after secrets are written
-# by 200_remote-agent-setup.sh. Bails fast on subsequent boots via the
-# install marker.
+# by 200_remote-agent-setup.sh. Bails fast on subsequent boots once the
+# codex binary is present.
 #
 # The installer (curl -fsSL https://chatgpt.com/codex/install.sh | sh) drops a
 # self-contained binary — no Node.js/npm needed. It installs unprivileged into
@@ -14,7 +14,6 @@ set -euo pipefail
 
 USER_NAME="user"
 USER_HOME="/home/${USER_NAME}"
-INSTALL_MARKER="${USER_HOME}/.ra-codex-installed"
 CODEX_BIN="${USER_HOME}/.local/bin/codex"
 
 # Source fetched secrets in case downstream scripts care; not strictly
@@ -23,13 +22,12 @@ CODEX_BIN="${USER_HOME}/.local/bin/codex"
 
 [ "${RA_PLUGIN_CODEX_ENABLED:-false}" = "true" ] || exit 0
 
-# Fast path / idempotency, gated on the binary rather than only the marker: a
-# workstation upgrading off the old npm-based plugin still has a stale
-# ~/.ra-codex-installed marker, but its codex lives at the old ~/.npm-global
-# path. A marker-only check would skip the install and leave /usr/local/bin/codex
-# (rebaked to point at ~/.local/bin) dangling. Keying on CODEX_BIN re-runs the
-# standalone installer in that case, then bails fast on every subsequent boot.
-[ -x "${CODEX_BIN}" ] && { touch "${INSTALL_MARKER}"; exit 0; }
+# Fast path / idempotency, keyed on the binary itself (not a marker file). This
+# also makes a workstation upgrading off the old npm-based plugin self-heal: its
+# codex lives at the old ~/.npm-global path, so CODEX_BIN is absent and the
+# standalone installer runs, populating ~/.local/bin and resolving the rebaked
+# /usr/local/bin/codex symlink. Every later boot then bails here.
+[ -x "${CODEX_BIN}" ] && exit 0
 
 # Download the installer to a file before running it: piping `curl --retry`
 # straight into sh would re-emit from byte 0 on a mid-transfer retry, feeding sh
@@ -47,10 +45,11 @@ chmod 0644 "${setup}"
 # prompts, which would otherwise hang a headless boot waiting on /dev/tty.
 # CODEX_RELEASE pins the version (RA_PLUGIN_CODEX_RELEASE config); 'latest' —
 # the config default, and the fallback if unset — installs the newest release.
+# PATH carries ~/.local/bin so the installer sees its target dir already on PATH
+# and skips appending an `export PATH=...` block to a shell dotfile: this plugin
+# puts codex on PATH via the /usr/local/bin symlink, never shell config (ADR 0002).
 sudo -u "${USER_NAME}" \
     env HOME="${USER_HOME}" CODEX_NON_INTERACTIVE=1 \
     CODEX_RELEASE="${RA_PLUGIN_CODEX_RELEASE:-latest}" \
+    PATH="${USER_HOME}/.local/bin:${PATH}" \
     sh "${setup}"
-
-touch "${INSTALL_MARKER}"
-chown "${USER_NAME}:${USER_NAME}" "${INSTALL_MARKER}"
