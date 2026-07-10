@@ -53,3 +53,10 @@ storm that crashes bash.
 - **Port-picker output is numeric-validated** after the read: a successful read of partial/garbage
   output (not just a read failure) is caught by a `[[ "$BOOT_PORT" =~ ^[0-9]+$ && ... ]]` guard, so a
   malformed allocation fails loudly instead of producing a confusing empty-port `et`/tunnel error.
+
+## References
+
+- The companion decision record on the CLI side lives in the
+  [`remote-agent`](https://github.com/adamtait/remote-agent) repo
+  (`docs/adr/0015`), which carries the full crash-reproduction evidence for the bash `/dev/tcp`
+  SIGABRT.
