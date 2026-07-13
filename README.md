@@ -19,6 +19,7 @@ Each plugin is a self-contained directory with a `plugin.yaml` manifest and opti
 | [gcloud](./gcloud/) | Google Cloud CLI — authenticates via a service-account key, a Workload Identity Federation config, or the workstation's own attached identity |
 | [github](./github/) | GitHub CLI + PAT-based git credential helper; optionally clones repos at first boot |
 | [marimo](./marimo/) | Reactive Python notebook server — auto-starts the edit server at boot |
+| [pulumi](./pulumi/) | Pulumi infrastructure-as-code CLI; optional Pulumi Cloud login via access token |
 | [terraform](./terraform/) | HashiCorp Terraform CLI |
 | [tmux](./tmux/) | tmux — starts a persistent named session at boot and auto-attaches login shells |
 | [uv](./uv/) | `uv` — fast Python package and project manager |
