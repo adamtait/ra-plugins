@@ -1,0 +1,30 @@
+name: pulumi
+version: "1.0.0"
+description: "Installs the Pulumi infrastructure-as-code CLI; optionally logs in to Pulumi Cloud via an access token"
+# post_install_message: printed by `ra plugin install`. Pulumi installs at first
+# boot into ~/.pulumi/bin (persistent /home disk); a build-time symlink puts it on
+# PATH as `pulumi`. The access token, if configured, reaches the shell via
+# /etc/environment as PULUMI_ACCESS_TOKEN (no login step needed).
+post_install_message: |
+  Pulumi installs on the workstation at first boot into ~/.pulumi/bin and is on
+  PATH as `pulumi`. If you configured a Pulumi Cloud access token it is exported
+  as PULUMI_ACCESS_TOKEN, so `pulumi up` works against Pulumi Cloud with no extra
+  login. Otherwise run `pulumi login` (Pulumi Cloud) or `pulumi login --local` /
+  `pulumi login s3://...` for a self-managed backend.
+config:
+  - name: enabled
+    type: bool
+    description: "Install the Pulumi CLI?"
+    default: false
+  - name: release
+    type: string
+    description: "Pulumi version to install, e.g. 3.252.0 (or 'latest' for the newest release)"
+    default: "latest"
+auth_providers:
+  - name: access_token
+    description: "Pulumi Cloud access token (optional — skip for self-managed backends)"
+    secrets:
+      - name: pulumi_access_token
+        env_var: PULUMI_ACCESS_TOKEN
+        description: "Access token from app.pulumi.com/account/tokens"
+        default_secret_name: pulumi-access-token
