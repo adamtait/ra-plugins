@@ -8,7 +8,7 @@ server binds loopback only and is never exposed on the network.
 ## What you get
 
 ```bash
-$ ra tunnel 2718:2718 <workstation>     # forward the edit server to your machine
+$ ra tunnel 2718        # forward the edit server to localhost:2718
 # then open http://localhost:2718 in your browser
 ```
 
