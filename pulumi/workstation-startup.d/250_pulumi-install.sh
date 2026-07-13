@@ -89,10 +89,16 @@ fi
 # The tarball's top level is pulumi/<binaries> (pulumi + language/resource hosts).
 tar -xzf "${tmpdir}/${ARCHIVE}" -C "${tmpdir}"
 
-# Install the binaries into ~/.pulumi/bin (install(1) replaces each in place).
-mkdir -p "${PULUMI_BIN_DIR}"
+# Install the binaries into ~/.pulumi/bin. Create the dirs as the user so
+# ~/.pulumi (which pulumi also uses for credentials/plugins/state) is user-owned
+# from first boot, and clear any prior binaries so a version change can't leave a
+# stale language host behind — matching Pulumi's own installer. Only the freshly
+# installed binaries are chowned (root wrote them), not all of ~/.pulumi, so a
+# reinstall never sweeps recursively over downloaded provider plugins or state.
+sudo -u "${USER_NAME}" mkdir -p "${PULUMI_BIN_DIR}"
+find "${PULUMI_BIN_DIR}" -mindepth 1 -maxdepth 1 -delete
 install -m 0755 "${tmpdir}/pulumi/"* "${PULUMI_BIN_DIR}/"
-chown -R "${USER_NAME}:${USER_NAME}" "${PULUMI_HOME}"
+chown "${USER_NAME}:${USER_NAME}" "${PULUMI_BIN_DIR}/"*
 
 # Confirm as the user (this is what the /usr/local/bin/pulumi symlink resolves to).
 sudo -u "${USER_NAME}" "${PULUMI_BIN}" version
