@@ -29,9 +29,6 @@ $ ra create
 - **Secrets by name, never in the image.** You paste a token once at install; `ra` stores the *value*
   in GCP Secret Manager and keeps only its *name* in config, which the workstation's own service
   account resolves at boot. Nothing sensitive is committed or baked into the Docker image.
-- **Off by default, enabled on purpose.** Plugins self-gate on `RA_PLUGIN_<NAME>_ENABLED`, so a plugin
-  changes a workstation only once you set `enabled` at install time. (`github` is the one exception —
-  it defaults to on.)
 - **Auth your way.** Plugins that need credentials offer a choice of providers: `claude` and `codex`
   take an OAuth login or an API key; `gcloud` takes a service-account key, a Workload Identity config,
   *or* the workstation's own attached identity; `aws` takes access keys.
