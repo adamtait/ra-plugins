@@ -1,0 +1,123 @@
+#!/bin/bash
+# Fake `gcloud storage` for tests/run.sh. Maps gs://<bucket>/<key> onto
+# ${FAKE_GCS}/<bucket>/<key> and tracks per-object generations under
+# ${FAKE_GCS}/.gen/ so --if-generation-match and obj#gen behave like GCS.
+# Covers only the subcommands the claude-sync scripts use.
+#
+# Race hook: if ${FAKE_GCS_RACE_MARKER} exists, the next conditional upload
+# first appends {"racer":true} to the destination (bumping its generation)
+# and deletes the marker, so the caller's precondition fails once.
+set -uo pipefail
+: "${FAKE_GCS:?FAKE_GCS must be set}"
+
+die() { echo "ERROR: (gcloud.fake) $*" >&2; exit 1; }
+
+is_gs() { [[ "$1" == gs://* ]]; }
+local_path() { local p="${1#gs://}"; printf '%s/%s' "${FAKE_GCS}" "${p%%#*}"; }
+gen_path() { local p="${1#gs://}"; printf '%s/.gen/%s' "${FAKE_GCS}" "${p%%#*}"; }
+cur_gen() { local g; g="$(cat "$(gen_path "$1")" 2>/dev/null || true)"; printf '%s' "${g:-0}"; }
+bump_gen() {
+    local counter="${FAKE_GCS}/.gen/.counter" n
+    mkdir -p "${FAKE_GCS}/.gen"
+    n=$(( $(cat "${counter}" 2>/dev/null || echo 0) + 1 ))
+    echo "${n}" > "${counter}"
+    mkdir -p "$(dirname "$(gen_path "$1")")"
+    echo "${n}" > "$(gen_path "$1")"
+}
+write_obj() { # $1 = local src file, $2 = gs:// dst
+    local dst; dst="$(local_path "$2")"
+    mkdir -p "$(dirname "${dst}")"
+    cp "$1" "${dst}"
+    bump_gen "$2"
+}
+
+[ "${1:-}" = storage ] || die "only 'storage' is faked"
+shift
+cmd="${1:-}"; shift || true
+
+case "${cmd}" in
+    ls)
+        recursive=0; args=()
+        for a in "$@"; do
+            case "${a}" in -r|--recursive) recursive=1 ;; -*) ;; *) args+=("${a}") ;; esac
+        done
+        url="${args[0]%\*\*}"
+        dir="$(local_path "${url}")"
+        [ -d "${dir}" ] || die "One or more URLs matched no objects."
+        if [ "${recursive}" -eq 1 ]; then
+            (cd "${dir}" && find . -type f | sed "s#^\./#${url%/}/#")
+        else
+            for e in "${dir%/}"/*; do
+                [ -e "${e}" ] || continue
+                if [ -d "${e}" ]; then echo "${url%/}/$(basename "${e}")/"; else echo "${url%/}/$(basename "${e}")"; fi
+            done
+        fi
+        ;;
+    cat)
+        f="$(local_path "$1")"
+        [ -f "${f}" ] || die "No URLs matched: $1"
+        cat "${f}"
+        ;;
+    objects)
+        [ "${1:-}" = describe ] || die "only 'objects describe' is faked"
+        f="$(local_path "$2")"
+        [ -f "${f}" ] || die "NotFound: $2"
+        cur_gen "$2"; echo
+        ;;
+    cp)
+        want=""; args=()
+        for a in "$@"; do
+            case "${a}" in --if-generation-match=*) want="${a#*=}" ;; -*) ;; *) args+=("${a}") ;; esac
+        done
+        src="${args[0]}"; dst="${args[1]}"
+        if is_gs "${src}"; then
+            sf="$(local_path "${src}")"
+            [ -f "${sf}" ] || die "No URLs matched: ${src}"
+            if [[ "${src}" == *#* ]] && [ "${src##*#}" != "$(cur_gen "${src}")" ]; then
+                die "NotFound: generation ${src##*#}"
+            fi
+        else
+            sf="${src}"
+            [ -f "${sf}" ] || die "No such file: ${src}"
+        fi
+        if is_gs "${dst}"; then
+            if [ -n "${want}" ]; then
+                if [ -n "${FAKE_GCS_RACE_MARKER:-}" ] && [ -f "${FAKE_GCS_RACE_MARKER}" ]; then
+                    rm -f "${FAKE_GCS_RACE_MARKER}"
+                    racer="$(mktemp)"
+                    cat "$(local_path "${dst}")" > "${racer}" 2>/dev/null || true
+                    echo '{"racer":true,"timestamp":1}' >> "${racer}"
+                    write_obj "${racer}" "${dst}"
+                    rm -f "${racer}"
+                fi
+                [ "${want}" = "$(cur_gen "${dst}")" ] || die "HTTPError 412: PreconditionFailed"
+            fi
+            write_obj "${sf}" "${dst}"
+        else
+            mkdir -p "$(dirname "${dst}")"
+            cp "${sf}" "${dst}"
+        fi
+        ;;
+    rsync)
+        args=()
+        for a in "$@"; do case "${a}" in -*) ;; *) args+=("${a}") ;; esac; done
+        src="${args[0]}"; dst="${args[1]}"
+        if is_gs "${src}"; then sdir="$(local_path "${src}")"; else sdir="${src}"; fi
+        [ -d "${sdir}" ] || die "Did not find existing container at: ${src}"
+        (cd "${sdir}" && find . -type f) | while IFS= read -r rel; do
+            rel="${rel#./}"
+            if is_gs "${dst}"; then
+                target="${dst%/}/${rel}"
+                tf="$(local_path "${target}")"
+                cmp -s "${sdir%/}/${rel}" "${tf}" 2>/dev/null || write_obj "${sdir%/}/${rel}" "${target}"
+            else
+                tf="${dst%/}/${rel}"
+                mkdir -p "$(dirname "${tf}")"
+                cmp -s "${sdir%/}/${rel}" "${tf}" 2>/dev/null || cp "${sdir%/}/${rel}" "${tf}"
+            fi
+        done
+        ;;
+    *)
+        die "storage ${cmd} not faked"
+        ;;
+esac
