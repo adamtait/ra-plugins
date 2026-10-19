@@ -1,7 +1,8 @@
 #!/bin/bash
 # claude-sync plugin — install + start the push loop.
 #
-# Materializes /usr/local/bin/ra-claude-sync-loop.sh and starts it.
+# Materializes /usr/local/bin/ra-claude-sync-loop.sh and the operator
+# command /usr/local/bin/claude-sync, then starts the loop.
 # Tries the systemd path first (writes /etc/systemd/system/ra-claude-sync.service
 # and enables/starts it). When systemd is not PID 1, falls back to a setsid-
 # detached background process (mirroring the marimo plugin's daemon pattern).
@@ -21,13 +22,20 @@
 # regardless of file mode quirks. All loop chatter goes to
 # /var/log/ra-claude-sync.log so operators can diagnose sync regressions
 # without bouncing the workstation just to read the journal.
+#
+# RA_CLAUDE_SYNC_BIN_DIR / RA_CLAUDE_SYNC_INSTALL_ONLY exist for tests/run.sh
+# only: install the scripts into a scratch dir and skip starting the loop.
 set -euo pipefail
 
-[ -r /run/ra/env ] && set -a && . /run/ra/env && set +a
+ENV_FILE="${RA_CLAUDE_SYNC_ENV_FILE:-/run/ra/env}"
+# shellcheck source=/dev/null
+[ -r "${ENV_FILE}" ] && set -a && . "${ENV_FILE}" && set +a
 
 [ "${RA_PLUGIN_CLAUDE_SYNC_ENABLED:-false}" = "true" ] || exit 0
 
-LOOP_PATH="/usr/local/bin/ra-claude-sync-loop.sh"
+BIN_DIR="${RA_CLAUDE_SYNC_BIN_DIR:-/usr/local/bin}"
+LOOP_PATH="${BIN_DIR}/ra-claude-sync-loop.sh"
+CLI_PATH="${BIN_DIR}/claude-sync"
 UNIT_PATH="/etc/systemd/system/ra-claude-sync.service"
 LOG_FILE="/var/log/ra-claude-sync.log"
 # Pidfile must agree with the path the loop script writes to. Lives in
@@ -35,24 +43,35 @@ LOG_FILE="/var/log/ra-claude-sync.log"
 # vanished process anyway.
 PID_FILE="/run/ra-claude-sync.pid"
 
+mkdir -p "${BIN_DIR}"
 cat > "${LOOP_PATH}" <<'LOOP_EOF'
 #!/bin/bash
 # ra-claude-sync push loop — installed by 271_claude-sync-daemon.sh.
 #
 # Waits for /run/ra/env (the core 200_*.sh boot script writes it on
-# every boot), then pushes a filtered allowlist of /home/user/.claude/
-# to gs://${BUCKET}/claude-sync/workstations/${WS_ID}/ every ${INTERVAL}
+# every boot) and for the boot pull to finish, then pushes a filtered
+# allowlist of /home/user/.claude/ to
+# gs://${BUCKET}/claude-sync/workstations/${WS_ID}/ every ${INTERVAL}
 # seconds. All data lives under the claude-sync/ prefix so other plugins
 # can share the same bucket without collisions.
 #
-# Push integrity (see docs/adr/0002-merge-based-sync.md):
+# Usage: ra-claude-sync-loop.sh [--once]
+#   --once  run a single push cycle (no pidfile, no pull wait) and exit
+#           non-zero if the cycle was incomplete. Used by `claude-sync push`.
+#
+# Push integrity (see docs/adr/0002-merge-based-sync.md, 0006-*):
+#   * history.jsonl and claude.json are MERGED with the remote copy before
+#     upload (read-modify-write guarded by --if-generation-match), never
+#     overwritten: a fresh disk, or a second workstation sharing this
+#     namespace, can no longer erase remote history.
 #   * history.jsonl is sanitized (torn/invalid lines dropped) before
 #     upload so a line caught mid-append never ships.
 #   * .claude.json is JSON-validated before upload; a torn read is
 #     skipped for the cycle.
 #   * the manifest is advanced ONLY when every push in the cycle
 #     succeeded, so a partial/failed push never advertises itself as
-#     "freshest".
+#     "freshest". It also records which instance wrote it, so a second
+#     live writer on the same namespace is logged as a WARN.
 #
 # All gcloud chatter is appended to /var/log/ra-claude-sync.log so a
 # silent regression in steady state is auditable. Exits with status 1
@@ -60,57 +79,47 @@ cat > "${LOOP_PATH}" <<'LOOP_EOF'
 # disabled at startup). Under systemd the Restart=always policy retries;
 # under the setsid fallback the loop simply dies until the next
 # workstation reboot re-runs 271_*.sh.
+#
+# The RA_CLAUDE_SYNC_* path overrides below exist for tests/run.sh only.
 set -uo pipefail
 
-USER_HOME="/home/user"
-LOG_FILE="/var/log/ra-claude-sync.log"
-PID_FILE="/run/ra-claude-sync.pid"
+ONCE=0
+[ "${1:-}" = "--once" ] && ONCE=1
+
+USER_HOME="${RA_CLAUDE_SYNC_USER_HOME:-/home/user}"
+LOG_FILE="${RA_CLAUDE_SYNC_LOG_FILE:-/var/log/ra-claude-sync.log}"
+PID_FILE="${RA_CLAUDE_SYNC_PID_FILE:-/run/ra-claude-sync.pid}"
+RUN_DIR="${RA_CLAUDE_SYNC_RUN_DIR:-/run/ra-claude-sync}"
+LIB="${RA_CLAUDE_SYNC_LIB:-/usr/local/lib/ra-claude-sync/lib.sh}"
+ENV_FILE="${RA_CLAUDE_SYNC_ENV_FILE:-/run/ra/env}"
+PULL_WAIT_SECONDS="${RA_CLAUDE_SYNC_PULL_WAIT_SECONDS:-1800}"
 # Last-known-good workstation id, cached on the persistent home disk.
+# shellcheck disable=SC2034  # read by resolve_ws_id in lib.sh
 WS_ID_CACHE="${USER_HOME}/.ra-claude-sync/ws-id"
 
 mkdir -p "$(dirname "${LOG_FILE}")" "$(dirname "${PID_FILE}")"
-exec >> "${LOG_FILE}" 2>&1
-
-# Record our PID so 271_*.sh can find and stop us idempotently on the
-# next boot. Cleaned up on exit. The pidfile is informational under
-# systemd (which tracks the process itself) but is the authoritative
-# handle under the setsid fallback path.
-echo $$ > "${PID_FILE}"
-trap 'rm -f "${PID_FILE}"' EXIT
+if [ "${ONCE}" -eq 1 ]; then
+    # Interactive one-shot: echo to the terminal as well as the log.
+    exec > >(tee -a "${LOG_FILE}") 2>&1
+else
+    exec >> "${LOG_FILE}" 2>&1
+    # Record our PID so 271_*.sh can find and stop us idempotently on the
+    # next boot. Cleaned up on exit. The pidfile is informational under
+    # systemd (which tracks the process itself) but is the authoritative
+    # handle under the setsid fallback path. A --once run must not touch
+    # it, or it would orphan the running daemon's handle.
+    echo $$ > "${PID_FILE}"
+    trap 'rm -f "${PID_FILE}"' EXIT
+fi
 
 log() { echo "[claude-sync-loop] $(date -u +%H:%M:%S) $*"; }
 
-# Resolve this workstation's stable id. Metadata is authoritative; we
-# cache the last-known-good value and prefer it over the `hostname`
-# fallback so a momentary metadata outage cannot fork our namespace.
-# MUST stay in sync with the identical function in 270_claude-sync-pull.sh.
-resolve_ws_id() {
-    local id="" i
-    for i in 1 2 3; do
-        id="$(curl -fs -H 'Metadata-Flavor: Google' \
-            'http://metadata.google.internal/computeMetadata/v1/instance/name' \
-            2>>"${LOG_FILE}" || true)"
-        [ -n "${id}" ] && break
-        id=""
-        sleep 1
-    done
-    if [ -n "${id}" ]; then
-        mkdir -p "$(dirname "${WS_ID_CACHE}")" 2>/dev/null || true
-        printf '%s\n' "${id}" > "${WS_ID_CACHE}" 2>/dev/null || true
-        printf '%s' "${id}"
-        return 0
-    fi
-    if [ -r "${WS_ID_CACHE}" ]; then
-        local cached
-        cached="$(head -n1 "${WS_ID_CACHE}" 2>/dev/null || true)"
-        if [ -n "${cached}" ]; then
-            printf '%s' "${cached}"
-            return 0
-        fi
-    fi
-    printf '%s' "$(hostname)"
-    return 1
-}
+if [ ! -r "${LIB}" ]; then
+    log "${LIB} missing (image built before claude-sync 1.2.0?); exiting 1"
+    exit 1
+fi
+# shellcheck source=/dev/null
+. "${LIB}"
 
 # Wait up to 5 minutes for /run/ra/env to be populated. On a fresh
 # workstation boot, this systemd unit may start before the core
@@ -119,18 +128,19 @@ resolve_ws_id() {
 # the service quietly stalled.
 ready=0
 for _ in $(seq 1 60); do
-    if [ -r /run/ra/env ]; then
+    if [ -r "${ENV_FILE}" ]; then
         ready=1
         break
     fi
     sleep 5
 done
 if [ "${ready}" -ne 1 ]; then
-    log "/run/ra/env not present after 5min; exiting 1 so systemd restarts us"
+    log "${ENV_FILE} not present after 5min; exiting 1 so systemd restarts us"
     exit 1
 fi
 
-set -a && . /run/ra/env && set +a
+# shellcheck source=/dev/null
+set -a && . "${ENV_FILE}" && set +a
 
 if [ "${RA_PLUGIN_CLAUDE_SYNC_ENABLED:-false}" != "true" ]; then
     log "plugin disabled at startup; exiting 1 so systemd restarts us if env later changes"
@@ -144,57 +154,147 @@ fi
 BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
 INTERVAL="${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60}"
 case "${INTERVAL}" in *[!0-9]*|"") INTERVAL=60 ;; esac
+case "${PULL_WAIT_SECONDS}" in *[!0-9]*|"") PULL_WAIT_SECONDS=1800 ;; esac
 
-# Namespace selection (load-reduction plan #3). Prefer the stable
-# RA_PLUGIN_CLAUDE_SYNC_NAMESPACE injected by `ra create` so a rebuilt
-# workstation pushes to ONE namespace instead of a fresh UUID namespace
-# each create. Fall back to resolve_ws_id() (metadata / cached / hostname)
-# when unset. Keep this block in sync with the identical selection in
-# 270_*.sh. Metadata is up by now (we waited for /run/ra/env, well after
-# boot), so the fallback resolves authoritatively and caches the value.
-if [ -n "${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE:-}" ]; then
-    WS_ID="${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE}"
-    log "using stable namespace from RA_PLUGIN_CLAUDE_SYNC_NAMESPACE=${WS_ID}"
-else
-    WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
-fi
+# Metadata is up by now (we waited for /run/ra/env, well after boot), so
+# the writer id resolves authoritatively and is cached.
+select_namespace
+WRITER_SINCE="$(date -u +%s)"
 
 PREFIX="gs://${BUCKET}/claude-sync/workstations/${WS_ID}"
 MANIFEST_PATH="gs://${BUCKET}/claude-sync/_manifest/${WS_ID}.json"
 
-log "starting push loop ws-id=${WS_ID} interval=${INTERVAL}s prefix=${PREFIX}"
+# Hold the first push until the boot pull has merged remote state in.
+# A missing pull.json means no pull ran this boot (plugin pull disabled, or
+# an old image): don't wait. The ceiling is only a backstop for a pull
+# killed hard enough to skip its EXIT trap; pushes merge with the remote
+# (below), so pushing early is safe, just noisier.
+wait_for_pull() {
+    local f="${RUN_DIR}/pull.json" state waited=0
+    [ -f "${f}" ] || return 0
+    while :; do
+        state="$(jq -r '.state // ""' "${f}" 2>/dev/null || true)"
+        if [ "${state}" != "running" ]; then
+            [ "${waited}" -gt 0 ] && log "boot pull finished (state=${state}) after ${waited}s; starting pushes"
+            return 0
+        fi
+        if [ "${waited}" -ge "${PULL_WAIT_SECONDS}" ]; then
+            log "WARN: boot pull still running after ${waited}s; starting pushes anyway (they merge, not overwrite)"
+            return 0
+        fi
+        [ "${waited}" -eq 0 ] && log "waiting for boot pull to finish before first push"
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+}
 
-# Upload history.jsonl with torn/invalid lines stripped. Returns non-zero
-# only if the upload itself failed (so the caller can withhold the
-# manifest); a file that is absent or has no valid lines is a no-op success.
+# Current generation of a remote object, or 0 if it doesn't exist (or
+# can't be described — the upload's precondition then fails and we retry).
+remote_generation() {
+    local gen
+    gen="$(gcloud storage objects describe "$1" --format='value(generation)' 2>/dev/null || true)"
+    case "${gen}" in ''|*[!0-9]*) gen=0 ;; esac
+    printf '%s' "${gen}"
+}
+
+# Read-modify-write a single-file member so concurrent writers converge on
+# the union instead of overwriting each other.
+#   $1 = remote object ; $2 = prepared local copy ; $3 = merge function
+#   (merge_jsonl_history | merge_claude_json, called as `$3 <out> <remote>`).
+# Uploads with --if-generation-match so a writer that raced us forces a
+# re-read rather than being clobbered. A failed merge aborts the upload —
+# shipping the unmerged local copy is exactly the overwrite this guards
+# against. Skips the upload when the merge changes nothing, so an idle
+# workstation doesn't mint a new (soft-delete-retained) generation every
+# cycle. Returns non-zero after 3 lost races/failed uploads or a failed
+# merge (the caller then withholds the manifest).
+push_merged() {
+    local obj="$1" src="$2" merge="$3" attempt gen remote out
+    for attempt in 1 2 3; do
+        gen="$(remote_generation "${obj}")"
+        remote="$(mktemp)"; out="$(mktemp)"
+        if [ "${gen}" != 0 ] && ! gcloud storage cp "${obj}#${gen}" "${remote}" 2>/dev/null; then
+            # Overwritten between describe and download; re-read.
+            rm -f "${remote}" "${out}"
+            continue
+        fi
+        cp "${src}" "${out}"
+        if ! "${merge}" "${out}" "${remote}"; then
+            log "merge of ${obj##*/} with remote failed; not uploading this cycle"
+            rm -f "${remote}" "${out}"
+            return 1
+        fi
+        if [ "${gen}" != 0 ] && cmp -s "${out}" "${remote}"; then
+            rm -f "${remote}" "${out}"
+            return 0
+        fi
+        if gcloud storage cp --if-generation-match="${gen}" "${out}" "${obj}"; then
+            rm -f "${remote}" "${out}"
+            return 0
+        fi
+        log "upload of ${obj##*/} lost a race or failed (attempt ${attempt}/3)"
+        rm -f "${remote}" "${out}"
+    done
+    return 1
+}
+
+# md5 of the prepared local copy last pushed successfully, per object. An
+# unchanged local file needs no gcloud calls at all: its content is already
+# in the remote (we merged it in last time, and other writers merge rather
+# than overwrite).
+declare -A LAST_PUSHED=()
+
+# push_merged, skipped when $2's content was already pushed to $1.
+push_if_changed() {
+    local sum
+    sum="$(md5sum < "$2" | cut -d' ' -f1)"
+    [ "${LAST_PUSHED[$1]:-}" = "${sum}" ] && return 0
+    push_merged "$@" || return 1
+    LAST_PUSHED[$1]="${sum}"
+}
+
+# Upload history.jsonl (torn/invalid lines stripped) merged with the remote
+# copy. Returns non-zero only if the upload itself failed (so the caller can
+# withhold the manifest); a file that is absent or has no valid lines is a
+# no-op success.
 push_history() {
-    local src="${USER_HOME}/.claude/history.jsonl" tmp
+    local src="${USER_HOME}/.claude/history.jsonl" tmp rc=0
     [ -f "${src}" ] || return 0
     tmp="$(mktemp)"
     jq -R -c 'fromjson? // empty' "${src}" > "${tmp}" 2>>"${LOG_FILE}" || true
     if [ -s "${tmp}" ]; then
-        if ! gcloud storage cp "${tmp}" "${PREFIX}/history.jsonl"; then
-            rm -f "${tmp}"; return 1
-        fi
+        push_if_changed "${PREFIX}/history.jsonl" "${tmp}" merge_jsonl_history || rc=1
     else
         log "history.jsonl had no valid lines this cycle; skipping its push"
     fi
     rm -f "${tmp}"
-    return 0
+    return "${rc}"
 }
 
-# Upload .claude.json only if it is currently valid JSON (a mid-write read
-# is skipped). A skipped invalid read is not a push failure.
+# Upload .claude.json, with the remote copy's per-project history unioned in,
+# only if the local file is currently valid JSON (a mid-write read is
+# skipped). The local file itself is never modified. A skipped invalid read
+# is not a push failure.
 push_claude_json() {
-    local src="${USER_HOME}/.claude.json"
+    local src="${USER_HOME}/.claude.json" tmp rc=0
     [ -f "${src}" ] || return 0
-    if jq -e . "${src}" >/dev/null 2>&1; then
-        gcloud storage cp "${src}" "${PREFIX}/claude.json" || return 1
+    tmp="$(mktemp)"
+    cp "${src}" "${tmp}"
+    if jq -e . "${tmp}" >/dev/null 2>&1; then
+        push_if_changed "${PREFIX}/claude.json" "${tmp}" merge_claude_json || rc=1
     else
         log ".claude.json not valid JSON this cycle; skipping its push"
     fi
-    return 0
+    rm -f "${tmp}"
+    return "${rc}"
 }
+
+# The shared-writer check reads the manifest (one gcloud call), so run it
+# at most every 10 minutes (or every cycle if INTERVAL is longer), and
+# repeat the WARN at most hourly.
+SHARED_CHECK_EVERY=$(( INTERVAL > 600 ? INTERVAL : 600 ))
+LAST_SHARED_CHECK=0
+LAST_SHARED_WARN=0
 
 push_once() {
     local ok=1 sub
@@ -207,22 +307,45 @@ push_once() {
     push_history    || ok=0
     push_claude_json || ok=0
 
-    # Manifest carries last_push_at so operators (and a future v2
-    # incremental pull) can see when each namespace last fully synced.
-    # Advance it ONLY on a fully-successful cycle so it never points at a
-    # namespace whose data upload failed.
+    # Before we overwrite the manifest, see whether a different instance
+    # wrote it recently: two live workstations on one namespace.
+    local now; now="$(date -u +%s)"
+    if [ $(( now - LAST_SHARED_CHECK )) -ge "${SHARED_CHECK_EVERY}" ] \
+        && [ $(( now - LAST_SHARED_WARN )) -ge 3600 ]; then
+        LAST_SHARED_CHECK="${now}"
+        if check_shared_writer "${MANIFEST_PATH}" $(( INTERVAL * 3 )); then
+            LAST_SHARED_WARN="${now}"
+        fi
+    fi
+
+    # Manifest carries last_push_at so the boot pull can rank namespaces
+    # and operators can see when each namespace last fully synced, plus the
+    # writer instance for shared-namespace detection. Advance it ONLY on a
+    # fully-successful cycle so it never points at a namespace whose data
+    # upload failed.
     if [ "${ok}" -eq 1 ]; then
-        local ts iso tmp
-        ts=$(date -u +%s)
-        iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        local iso tmp
+        iso=$(date -u -d "@${now}" +"%Y-%m-%dT%H:%M:%SZ")
         tmp=$(mktemp)
-        printf '{"last_push_at": "%s", "last_push_at_epoch": %s}\n' "${iso}" "${ts}" > "${tmp}"
+        jq -n --arg iso "${iso}" --argjson ts "${now}" \
+            --arg writer "${WRITER_ID}" --argjson since "${WRITER_SINCE}" \
+            '{last_push_at: $iso, last_push_at_epoch: $ts, writer: $writer, writer_since: $since}' > "${tmp}"
         gcloud storage cp "${tmp}" "${MANIFEST_PATH}" || log "manifest upload failed"
         rm -f "${tmp}"
-    else
-        log "push cycle incomplete; not advancing manifest"
+        return 0
     fi
+    log "push cycle incomplete; not advancing manifest"
+    return 1
 }
+
+if [ "${ONCE}" -eq 1 ]; then
+    log "one-shot push ws-id=${WS_ID} writer=${WRITER_ID} prefix=${PREFIX}"
+    push_once
+    exit $?
+fi
+
+log "starting push loop ws-id=${WS_ID} writer=${WRITER_ID} interval=${INTERVAL}s prefix=${PREFIX}"
+wait_for_pull
 
 while true; do
     push_once
@@ -230,6 +353,97 @@ while true; do
 done
 LOOP_EOF
 chmod 0755 "${LOOP_PATH}"
+
+cat > "${CLI_PATH}" <<'CLI_EOF'
+#!/bin/bash
+# claude-sync — operator command, installed by 271_claude-sync-daemon.sh.
+#
+#   claude-sync pull     merge remote state (incl. full own-namespace restore) into ~/.claude now
+#   claude-sync push     run one push cycle now
+#   claude-sync status   show bucket, namespace, loop, last pull/push, and warnings
+#
+# pull/push re-exec under sudo: they need root for the log file, chown,
+# and the service-account gcloud auth the boot scripts use.
+set -euo pipefail
+
+PULL_SCRIPT="/etc/workstation-startup.d/270_claude-sync-pull.sh"
+LOOP_SCRIPT="/usr/local/bin/ra-claude-sync-loop.sh"
+LIB="/usr/local/lib/ra-claude-sync/lib.sh"
+PID_FILE="/run/ra-claude-sync.pid"
+RUN_DIR="/run/ra-claude-sync"
+SYNC_LOG="/var/log/ra-claude-sync.log"
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else exec sudo "$@"; fi
+}
+
+load_env() {
+    if [ -r /run/ra/env ]; then set -a; . /run/ra/env; set +a; fi
+}
+
+status() {
+    load_env
+    # Same identity + shared-writer logic as the loop (lib.sh). The lib logs
+    # gcloud stderr to LOG_FILE, which this unprivileged command can't write.
+    # shellcheck disable=SC2034  # read by lib.sh
+    LOG_FILE=/dev/null WS_ID_CACHE="${HOME}/.ra-claude-sync/ws-id"
+    log() { echo "            $*"; }
+    # shellcheck source=/dev/null
+    . "${LIB}"
+    select_namespace >/dev/null
+    local bucket="${RA_PLUGIN_CLAUDE_SYNC_BUCKET:-}" ns="${WS_ID}"
+    echo "enabled:    ${RA_PLUGIN_CLAUDE_SYNC_ENABLED:-false}"
+    echo "bucket:     ${bucket:-<unset>}"
+    echo "namespace:  ${ns} (this instance: ${WRITER_ID})"
+    local pid=""
+    [ -r "${PID_FILE}" ] && pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+    # /proc, not kill -0: the loop runs as root, so kill -0 from this
+    # unprivileged shell fails with EPERM on a live process.
+    if [ -n "${pid}" ] && [ -d "/proc/${pid}" ]; then
+        echo "push loop:  running (pid ${pid}, every ${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60}s)"
+    else
+        echo "push loop:  NOT running (restart: sudo /etc/workstation-startup.d/271_claude-sync-daemon.sh)"
+    fi
+    if [ -r "${RUN_DIR}/pull.json" ]; then
+        jq -r '"last pull:  \(.state), \(.namespaces) namespace(s), \(.files_restored) file(s) restored"
+               + (if .finished_at then ", finished \(.finished_at | todate)" else "" end)' "${RUN_DIR}/pull.json"
+    else
+        echo "last pull:  none recorded this boot"
+    fi
+    [ -n "${bucket}" ] || return 0
+    local prefix="gs://${bucket}/claude-sync" mfile row now
+    now="$(date -u +%s)"
+    mfile="$(mktemp)"
+    if gcloud storage cp "${prefix}/_manifest/${ns}.json" "${mfile}" >/dev/null 2>&1; then
+        row="$(read_manifest_writer "${mfile}")"
+        local ts="${row#*	}"
+        case "${ts}" in ''|*[!0-9]*) ts=0 ;; esac
+        local writer="${row%%	*}"
+        echo "last push:  $(( now - ts ))s ago by ${writer:-unknown (manifest from a pre-1.2.0 loop)}"
+        check_shared_writer "${mfile}" $(( ${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60} * 3 )) || true
+    else
+        echo "last push:  no manifest yet"
+    fi
+    rm -f "${mfile}"
+    local remote local_n
+    remote="$(gcloud storage ls -r "${prefix}/workstations/${ns}/projects/**" 2>/dev/null | grep -c '^gs://' || true)"
+    local_n="$(find "${HOME}/.claude/projects" -type f 2>/dev/null | wc -l)"
+    echo "projects/:  ${local_n} file(s) local, ${remote} in own namespace"
+    echo "log:        ${SYNC_LOG}"
+}
+
+case "${1:-}" in
+    # An explicit pull also restores the own namespace's directories, even
+    # if this disk restored it before (boot pulls only do that once).
+    pull) as_root env RA_CLAUDE_SYNC_PULL_DETACHED=1 RA_CLAUDE_SYNC_RESTORE_OWN=1 "${PULL_SCRIPT}" ;;
+    push) as_root "${LOOP_SCRIPT}" --once ;;
+    status) status ;;
+    *) sed -n '4,6p' "$0" | sed 's/^# //'; exit 2 ;;
+esac
+CLI_EOF
+chmod 0755 "${CLI_PATH}"
+
+[ "${RA_CLAUDE_SYNC_INSTALL_ONLY:-0}" = "1" ] && exit 0
 
 # PID 1 detection. Cloud Workstations' default image runs
 # /google/scripts/entrypoint.sh as PID 1, so /proc/1/comm reads as
