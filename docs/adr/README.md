@@ -25,4 +25,4 @@ Each ADR follows a lightweight *Context / Decision / Consequences* form.
   - [0003 — Daemon launch: setsid fallback when systemd is not PID 1](../../claude-sync/docs/adr/0003-daemon-launch-setsid-fallback.md)
   - [0004 — Load reduction: filtered pull, stable namespace, bucket lifecycle](../../claude-sync/docs/adr/0004-load-reduction.md)
   - [0005 — Bucket naming, shared-bucket prefixing, and cross-project sync](../../claude-sync/docs/adr/0005-bucket-naming-and-namespacing.md)
-  - [0006 — Rebuild restore, merge-on-push, and per-workstation namespaces](../../claude-sync/docs/adr/0006-rebuild-restore-and-merge-on-push.md)
+  - [0006 — Rebuild restore, merge-on-push, and shared-namespace safety](../../claude-sync/docs/adr/0006-rebuild-restore-and-merge-on-push.md)

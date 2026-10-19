@@ -1,9 +1,9 @@
-# 6. Rebuild restore, merge-on-push, and per-workstation namespaces
+# 6. Rebuild restore, merge-on-push, and shared-namespace safety
 
 - Status: accepted (2026-10-19)
-- Supersedes: ADR 0004 #1's "our own namespace is always skipped (push-only)", and ADR 0004 #3's
-  `(project, config, email)` id (amended to add the workstation name)
-- Applies to: `claude-sync` plugin (+ `stable_id` and `soft_delete_days` in `ra` core)
+- Supersedes: ADR 0004 #1's "our own namespace is always skipped (push-only)", and ADR 0002's
+  assumption that each namespace has exactly one writer
+- Applies to: `claude-sync` plugin (+ `soft_delete_days` in `ra` core)
 
 ## Context
 
@@ -17,9 +17,11 @@ A rebuilt workstation came up with an almost empty `~/.claude` and the boot pull
 2. **Push overwrote single files.** `history.jsonl` and `claude.json` were uploaded with a plain
    `gcloud storage cp`. Within one cycle of boot, the fresh disk's near-empty copies replaced the
    previous build's. Transcripts survived only because the directory `rsync` never deletes.
-3. **Two live workstations shared one namespace.** The stable id omits the workstation name, so every
-   workstation built from the same config pushes to the same prefix. The bucket showed
-   `history.jsonl` alternating between two writers' copies every ~5 minutes, each erasing the other.
+3. **Two live workstations shared one namespace.** The stable id is injected through the workstation
+   *config's* container env, so every workstation on a config shares it by design. `ra create` always
+   creates a new workstation, so a rebuild runs alongside the old one until the old one is deleted.
+   The bucket showed `history.jsonl` alternating between two writers' copies every ~5 minutes, each
+   erasing the other.
 4. **Nothing reported it.** No signal for "local is empty but my namespace isn't", and none for "someone
    else is writing my namespace".
 
@@ -52,11 +54,15 @@ recovery possible.
 - **Writer identity in the manifest.** The manifest gains `writer` (GCE instance name) and
   `writer_since`. The loop reads it before overwriting it, and both scripts WARN if a different
   instance pushed within 3× interval.
-- **Per-workstation stable id (core).** `ra create` derives the id from
-  `(project, config, workstation name, email)`. The workstation name is itself derived from project +
-  local username, so it's still stable across rebuilds.
+- **Shared namespaces are made safe, not prevented.** A per-workstation id was tried and rejected.
+  Env vars exist only at config scope, and the workstation's final name is chosen after the config is
+  written. "Stable across rebuilds" and "distinct from the still-running old build" also conflict,
+  because a rebuild *is* a new workstation. Instead, the merge-on-push above makes concurrent writers
+  converge, and the writer check makes them visible. Deleting the old workstation after a rebuild
+  ends the overlap.
 - **Soft delete is declared, not assumed.** `buckets[].soft_delete_days: 7` in `plugin.yaml`. `ra`
-  core applies it (max across plugins sharing a bucket). Chosen over object versioning, which would
+  core only ever raises the bucket's retention to it (never lowers a longer policy on a shared
+  bucket), and a failure to set it is a warning. Chosen over object versioning, which would
   keep a *second* retained copy of every per-cycle re-upload on top of soft delete.
 - **Shared library + operator command.** Merge, identity and namespace functions live once in
   `/usr/local/lib/ra-claude-sync/lib.sh` (baked by `Dockerfile.d/110_*.sh`) instead of being copied
@@ -65,9 +71,9 @@ recovery possible.
 
 ## Consequences
 
-- **One-time namespace change.** Adding the workstation name changes every workstation's id once.
-  The old shared namespace becomes an ordinary *other* namespace inside the 30-day window, so the first
-  boot after the change merges it. It then ages out and lifecycle reclaims it. No data is moved.
+- **Namespace ids don't change.** No migration is needed.
+- While a rebuild's old and new workstations both run, the shared-writer WARN fires. That's expected,
+  and it stops once the old workstation is deleted.
 - A push cycle with changed single files makes up to 4 more gcloud calls (describe + download per
   file). Unchanged files cost none, and the shared-writer manifest read runs at most every 10 min.
 - The first boot of an upgraded workstation (no marker yet) restores the own namespace once, which

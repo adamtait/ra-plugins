@@ -81,8 +81,9 @@ Workstation B ──┘     claude-sync/             └── Workstation D
                         _manifest/<ws-id>.json
 ```
 
-- Each workstation pushes only to `claude-sync/workstations/<ws-id>/`. `ra create` derives `<ws-id>`
-  from (project, config, workstation name, email), so it's stable across rebuilds and unique per workstation.
+- Each workstation pushes to `claude-sync/workstations/<ws-id>/`. `ra create` derives `<ws-id>` from
+  (project, workstation config, email), so it's stable across rebuilds. It's shared by every
+  workstation on that config, including a rebuild's old and new machines while both run.
 - Boot pull merges its own namespace (restore) plus the recent other namespaces into `~/.claude/`:
   directory trees via `cp -an` (local files win), `history.jsonl` via union-merge, `.claude.json` via
   local-base + per-project history union. Progress goes to `/run/ra-claude-sync/pull.json`.
@@ -168,9 +169,9 @@ results, pasted content — and flow verbatim into the GCS bucket.
   fully each cycle. v2 plans a delta-append approach.
 - Parallel `CLAUDE.md` memory edits on two workstations resolve by last-merge-order on pull; no
   conflict UI yet.
-- Workstations created by `ra` releases before the per-workstation id share a namespace per config.
-  Pushes merge, so nothing is lost, but `claude-sync status` warns until each is recreated. The first
-  boot on the new id merges the old shared namespace as an ordinary other namespace.
+- Two live workstations on one config (typically a rebuild's new machine while the old one still
+  runs) share a namespace. Pushes merge, so nothing is lost, but `claude-sync status` and the log warn
+  about a second writer. Delete the old workstation once the new one is set up.
 - `.claude.json` merge can create a project entry holding only a `history` array for projects you've
   never opened here (so up-arrow history works when you first `cd` in); Claude fills the rest with defaults.
 
