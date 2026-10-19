@@ -202,8 +202,12 @@ remote_generation() {
 #   $1 = remote object ; $2 = prepared local copy ; $3 = merge function
 #   (merge_jsonl_history | merge_claude_json, called as `$3 <out> <remote>`).
 # Uploads with --if-generation-match so a writer that raced us forces a
-# re-read rather than being clobbered. Returns non-zero after 3 lost races
-# or failed uploads (the caller then withholds the manifest).
+# re-read rather than being clobbered. A failed merge aborts the upload —
+# shipping the unmerged local copy is exactly the overwrite this guards
+# against. Skips the upload when the merge changes nothing, so an idle
+# workstation doesn't mint a new (soft-delete-retained) generation every
+# cycle. Returns non-zero after 3 lost races/failed uploads or a failed
+# merge (the caller then withholds the manifest).
 push_merged() {
     local obj="$1" src="$2" merge="$3" attempt gen remote out
     for attempt in 1 2 3; do
@@ -215,7 +219,15 @@ push_merged() {
             continue
         fi
         cp "${src}" "${out}"
-        "${merge}" "${out}" "${remote}"
+        if ! "${merge}" "${out}" "${remote}"; then
+            log "merge of ${obj##*/} with remote failed; not uploading this cycle"
+            rm -f "${remote}" "${out}"
+            return 1
+        fi
+        if [ "${gen}" != 0 ] && cmp -s "${out}" "${remote}"; then
+            rm -f "${remote}" "${out}"
+            return 0
+        fi
         if gcloud storage cp --if-generation-match="${gen}" "${out}" "${obj}"; then
             rm -f "${remote}" "${out}"
             return 0
@@ -224,6 +236,21 @@ push_merged() {
         rm -f "${remote}" "${out}"
     done
     return 1
+}
+
+# md5 of the prepared local copy last pushed successfully, per object. An
+# unchanged local file needs no gcloud calls at all: its content is already
+# in the remote (we merged it in last time, and other writers merge rather
+# than overwrite).
+declare -A LAST_PUSHED=()
+
+# push_merged, skipped when $2's content was already pushed to $1.
+push_if_changed() {
+    local sum
+    sum="$(md5sum < "$2" | cut -d' ' -f1)"
+    [ "${LAST_PUSHED[$1]:-}" = "${sum}" ] && return 0
+    push_merged "$@" || return 1
+    LAST_PUSHED[$1]="${sum}"
 }
 
 # Upload history.jsonl (torn/invalid lines stripped) merged with the remote
@@ -236,7 +263,7 @@ push_history() {
     tmp="$(mktemp)"
     jq -R -c 'fromjson? // empty' "${src}" > "${tmp}" 2>>"${LOG_FILE}" || true
     if [ -s "${tmp}" ]; then
-        push_merged "${PREFIX}/history.jsonl" "${tmp}" merge_jsonl_history || rc=1
+        push_if_changed "${PREFIX}/history.jsonl" "${tmp}" merge_jsonl_history || rc=1
     else
         log "history.jsonl had no valid lines this cycle; skipping its push"
     fi
@@ -254,7 +281,7 @@ push_claude_json() {
     tmp="$(mktemp)"
     cp "${src}" "${tmp}"
     if jq -e . "${tmp}" >/dev/null 2>&1; then
-        push_merged "${PREFIX}/claude.json" "${tmp}" merge_claude_json || rc=1
+        push_if_changed "${PREFIX}/claude.json" "${tmp}" merge_claude_json || rc=1
     else
         log ".claude.json not valid JSON this cycle; skipping its push"
     fi
@@ -262,7 +289,11 @@ push_claude_json() {
     return "${rc}"
 }
 
-# Rate limit for the shared-writer WARN (once per hour, not every cycle).
+# The shared-writer check reads the manifest (one gcloud call), so run it
+# at most every 10 minutes (or every cycle if INTERVAL is longer), and
+# repeat the WARN at most hourly.
+SHARED_CHECK_EVERY=$(( INTERVAL > 600 ? INTERVAL : 600 ))
+LAST_SHARED_CHECK=0
 LAST_SHARED_WARN=0
 
 push_once() {
@@ -279,9 +310,12 @@ push_once() {
     # Before we overwrite the manifest, see whether a different instance
     # wrote it recently: two live workstations on one namespace.
     local now; now="$(date -u +%s)"
-    if [ $(( now - LAST_SHARED_WARN )) -ge 3600 ] \
-        && check_shared_writer "${MANIFEST_PATH}" $(( INTERVAL * 3 )); then
-        LAST_SHARED_WARN="${now}"
+    if [ $(( now - LAST_SHARED_CHECK )) -ge "${SHARED_CHECK_EVERY}" ] \
+        && [ $(( now - LAST_SHARED_WARN )) -ge 3600 ]; then
+        LAST_SHARED_CHECK="${now}"
+        if check_shared_writer "${MANIFEST_PATH}" $(( INTERVAL * 3 )); then
+            LAST_SHARED_WARN="${now}"
+        fi
     fi
 
     # Manifest carries last_push_at so the boot pull can rank namespaces
@@ -324,7 +358,7 @@ cat > "${CLI_PATH}" <<'CLI_EOF'
 #!/bin/bash
 # claude-sync — operator command, installed by 271_claude-sync-daemon.sh.
 #
-#   claude-sync pull     merge remote state into ~/.claude now (foreground, streams the log)
+#   claude-sync pull     merge remote state (incl. full own-namespace restore) into ~/.claude now
 #   claude-sync push     run one push cycle now
 #   claude-sync status   show bucket, namespace, loop, last pull/push, and warnings
 #
@@ -334,9 +368,10 @@ set -euo pipefail
 
 PULL_SCRIPT="/etc/workstation-startup.d/270_claude-sync-pull.sh"
 LOOP_SCRIPT="/usr/local/bin/ra-claude-sync-loop.sh"
+LIB="/usr/local/lib/ra-claude-sync/lib.sh"
 PID_FILE="/run/ra-claude-sync.pid"
 RUN_DIR="/run/ra-claude-sync"
-LOG_FILE="/var/log/ra-claude-sync.log"
+SYNC_LOG="/var/log/ra-claude-sync.log"
 
 as_root() {
     if [ "$(id -u)" -eq 0 ]; then "$@"; else exec sudo "$@"; fi
@@ -348,13 +383,23 @@ load_env() {
 
 status() {
     load_env
-    local bucket="${RA_PLUGIN_CLAUDE_SYNC_BUCKET:-}" ns="${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE:-}"
+    # Same identity + shared-writer logic as the loop (lib.sh). The lib logs
+    # gcloud stderr to LOG_FILE, which this unprivileged command can't write.
+    # shellcheck disable=SC2034  # read by lib.sh
+    LOG_FILE=/dev/null WS_ID_CACHE="${HOME}/.ra-claude-sync/ws-id"
+    log() { echo "            $*"; }
+    # shellcheck source=/dev/null
+    . "${LIB}"
+    select_namespace >/dev/null
+    local bucket="${RA_PLUGIN_CLAUDE_SYNC_BUCKET:-}" ns="${WS_ID}"
     echo "enabled:    ${RA_PLUGIN_CLAUDE_SYNC_ENABLED:-false}"
     echo "bucket:     ${bucket:-<unset>}"
-    echo "namespace:  ${ns:-<unset; falls back to instance name>}"
+    echo "namespace:  ${ns} (this instance: ${WRITER_ID})"
     local pid=""
     [ -r "${PID_FILE}" ] && pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
-    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+    # /proc, not kill -0: the loop runs as root, so kill -0 from this
+    # unprivileged shell fails with EPERM on a live process.
+    if [ -n "${pid}" ] && [ -d "/proc/${pid}" ]; then
         echo "push loop:  running (pid ${pid}, every ${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60}s)"
     else
         echo "push loop:  NOT running (restart: sudo /etc/workstation-startup.d/271_claude-sync-daemon.sh)"
@@ -365,33 +410,32 @@ status() {
     else
         echo "last pull:  none recorded this boot"
     fi
-    [ -n "${bucket}" ] && [ -n "${ns}" ] || return 0
-    local prefix="gs://${bucket}/claude-sync" manifest now writer ts
+    [ -n "${bucket}" ] || return 0
+    local prefix="gs://${bucket}/claude-sync" mfile row now
     now="$(date -u +%s)"
-    manifest="$(gcloud storage cat "${prefix}/_manifest/${ns}.json" 2>/dev/null || true)"
-    if [ -n "${manifest}" ]; then
-        writer="$(jq -r '.writer // "unknown"' <<<"${manifest}")"
-        ts="$(jq -r '.last_push_at_epoch // 0' <<<"${manifest}")"
-        echo "last push:  $(( now - ts ))s ago by ${writer}"
-        local me
-        me="$(curl -fs -H 'Metadata-Flavor: Google' \
-            'http://metadata.google.internal/computeMetadata/v1/instance/name' 2>/dev/null || hostname)"
-        if [ "${writer}" != "unknown" ] && [ "${writer}" != "${me}" ] \
-            && [ $(( now - ts )) -le $(( ${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60} * 3 )) ]; then
-            echo "WARNING:    another live workstation (${writer}) pushes to this namespace; this is ${me}"
-        fi
+    mfile="$(mktemp)"
+    if gcloud storage cp "${prefix}/_manifest/${ns}.json" "${mfile}" >/dev/null 2>&1; then
+        row="$(read_manifest_writer "${mfile}")"
+        local ts="${row#*	}"
+        case "${ts}" in ''|*[!0-9]*) ts=0 ;; esac
+        local writer="${row%%	*}"
+        echo "last push:  $(( now - ts ))s ago by ${writer:-unknown (manifest from a pre-1.2.0 loop)}"
+        check_shared_writer "${mfile}" $(( ${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60} * 3 )) || true
     else
         echo "last push:  no manifest yet"
     fi
+    rm -f "${mfile}"
     local remote local_n
     remote="$(gcloud storage ls -r "${prefix}/workstations/${ns}/projects/**" 2>/dev/null | grep -c '^gs://' || true)"
     local_n="$(find "${HOME}/.claude/projects" -type f 2>/dev/null | wc -l)"
     echo "projects/:  ${local_n} file(s) local, ${remote} in own namespace"
-    echo "log:        ${LOG_FILE}"
+    echo "log:        ${SYNC_LOG}"
 }
 
 case "${1:-}" in
-    pull) as_root env RA_CLAUDE_SYNC_PULL_DETACHED=1 "${PULL_SCRIPT}" ;;
+    # An explicit pull also restores the own namespace's directories, even
+    # if this disk restored it before (boot pulls only do that once).
+    pull) as_root env RA_CLAUDE_SYNC_PULL_DETACHED=1 RA_CLAUDE_SYNC_RESTORE_OWN=1 "${PULL_SCRIPT}" ;;
     push) as_root "${LOOP_SCRIPT}" --once ;;
     status) status ;;
     *) sed -n '4,6p' "$0" | sed 's/^# //'; exit 2 ;;

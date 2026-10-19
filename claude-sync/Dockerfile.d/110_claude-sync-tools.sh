@@ -96,7 +96,9 @@ select_namespace() {
 # created in the destination's own directory so the write-back is a true
 # atomic rename (mv across filesystems would be a non-atomic copy). Never
 # replaces the destination with an empty result (guards a jq failure from
-# wiping history).
+# wiping history). Returns 1 when the merge failed or came out empty (the
+# destination is then untouched) so the push can refuse to upload an
+# unmerged copy; 0 on success or when there was nothing to merge.
 merge_jsonl_history() {
     local dest="$1"; shift
     local -a files=()
@@ -114,14 +116,15 @@ merge_jsonl_history() {
         fi
     fi
     rm -f "${tmp}"
-    return 0
+    return 1
 }
 
 # Merge .claude.json: keep the local file as the authoritative base and
 # union in only per-project `history` arrays from remote copies.
 #   $1 = .claude.json (base, rewritten in place) ; $2.. = remote claude.json files.
 # Skips any source (including the base) that is not valid JSON. Atomic,
-# validated write-back.
+# validated write-back. Returns 1 if the jq merge itself failed (base
+# untouched); 0 on success or when no valid remote source exists.
 merge_claude_json() {
     local base="$1"; shift
     [ -f "${base}" ] || return 0
@@ -155,19 +158,22 @@ merge_claude_json() {
         fi
     fi
     rm -f "${tmp}"
-    return 0
+    return 1
 }
 
 # Read a namespace manifest's writer fields as "<writer>\t<last_push_at_epoch>".
-# Prints nothing if the manifest is missing or unreadable.
+# $1 is a gs:// object or an already-downloaded local file. Prints nothing
+# if the manifest is missing or unreadable.
 read_manifest_writer() {
-    gcloud storage cat "$1" 2>>"${LOG_FILE}" \
+    local reader=(cat)
+    [[ "$1" == gs://* ]] && reader=(gcloud storage cat)
+    "${reader[@]}" "$1" 2>>"${LOG_FILE}" \
         | jq -r '"\(.writer // "")\t\(.last_push_at_epoch // 0)"' 2>>"${LOG_FILE}" || true
 }
 
 # Warn when a manifest shows a different instance pushed to this namespace
 # recently — two live workstations sharing one namespace (ADR 0006).
-#   $1 = manifest gs:// path ; $2 = freshness window in seconds.
+#   $1 = manifest (gs:// or local file) ; $2 = freshness window in seconds.
 # Returns 0 and logs a WARN if shared, 1 otherwise.
 check_shared_writer() {
     local row writer ts now

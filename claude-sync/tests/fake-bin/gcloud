@@ -15,7 +15,6 @@ die() { echo "ERROR: (gcloud.fake) $*" >&2; exit 1; }
 is_gs() { [[ "$1" == gs://* ]]; }
 local_path() { local p="${1#gs://}"; printf '%s/%s' "${FAKE_GCS}" "${p%%#*}"; }
 gen_path() { local p="${1#gs://}"; printf '%s/.gen/%s' "${FAKE_GCS}" "${p%%#*}"; }
-cur_gen() { local g; g="$(cat "$(gen_path "$1")" 2>/dev/null || true)"; printf '%s' "${g:-0}"; }
 bump_gen() {
     local counter="${FAKE_GCS}/.gen/.counter" n
     mkdir -p "${FAKE_GCS}/.gen"
@@ -23,6 +22,17 @@ bump_gen() {
     echo "${n}" > "${counter}"
     mkdir -p "$(dirname "$(gen_path "$1")")"
     echo "${n}" > "$(gen_path "$1")"
+}
+# Like GCS, an existing object always has a non-zero generation: objects
+# seeded straight into ${FAKE_GCS} by a test get one on first look.
+cur_gen() {
+    local g
+    g="$(cat "$(gen_path "$1")" 2>/dev/null || true)"
+    if [ -z "${g}" ] && [ -f "$(local_path "$1")" ]; then
+        bump_gen "$1"
+        g="$(cat "$(gen_path "$1")")"
+    fi
+    printf '%s' "${g:-0}"
 }
 write_obj() { # $1 = local src file, $2 = gs:// dst
     local dst; dst="$(local_path "$2")"

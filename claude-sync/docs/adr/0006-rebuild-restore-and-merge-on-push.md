@@ -28,15 +28,24 @@ recovery possible.
 
 ## Decision
 
-- **Pull restores its own namespace.** `270_*.sh` stages the own namespace first, exempt from the age
-  filter and the cap, with the unchanged merge rules (`cp -an` local-wins, `history.jsonl` union,
-  `.claude.json` history union). It logs files restored per subtree, and WARNs on the fresh-disk
-  signature.
+- **Pull restores its own namespace once per disk.** When `~/.ra-claude-sync/restored-<ws-id>` is
+  absent (a fresh home disk), or `claude-sync pull` forces it, `270_*.sh` restores the own namespace's
+  directories, exempt from the age filter and the cap. It then writes the marker. On ordinary reboots
+  only the namespace's `history.jsonl` / `claude.json` are union-merged: re-copying directories every
+  boot would bring back transcripts Claude Code deliberately cleaned up, and would re-download the
+  whole namespace each time.
+- **Per-namespace staging, priority order.** Each namespace stages into its own directory, and the
+  copy into `~/.claude` walks them own-first, then others newest-first, with `cp -an`. A shared stage
+  had let an older foreign copy of a transcript replace the own namespace's newer one, which the next
+  push would then upload.
 - **Push merges instead of overwriting.** `history.jsonl` and `claude.json` are read-modify-written:
   read the remote object's generation, download that generation, merge the local copy in with the same
   functions the pull uses, and upload with `--if-generation-match` (`0` = must not exist). A lost race
   re-reads, up to 3 attempts, after which the cycle counts as incomplete and the manifest is not
-  advanced. The local `.claude.json` is never modified by a push.
+  advanced. A failed merge aborts the upload rather than shipping the unmerged copy. Unchanged
+  content isn't re-uploaded (an md5 cache of the last push, plus a compare with the remote), so idle
+  workstations don't mint a soft-delete-retained generation every cycle. The local `.claude.json` is
+  never modified by a push.
 - **Push waits for the boot pull.** `270_*.sh` writes `/run/ra-claude-sync/pull.json`
   (`running|done|failed`, marked `running` before it detaches). The loop holds its first push until the
   state leaves `running`, with a 30-minute backstop. A missing file means "don't wait".
@@ -59,8 +68,10 @@ recovery possible.
 - **One-time namespace change.** Adding the workstation name changes every workstation's id once.
   The old shared namespace becomes an ordinary *other* namespace inside the 30-day window, so the first
   boot after the change merges it. It then ages out and lifecycle reclaims it. No data is moved.
-- Each push cycle makes ~5 more gcloud calls (2 × describe + download for the RMW, plus one manifest
-  read). That's negligible at the default intervals.
+- A push cycle with changed single files makes up to 4 more gcloud calls (describe + download per
+  file). Unchanged files cost none, and the shared-writer manifest read runs at most every 10 min.
+- The first boot of an upgraded workstation (no marker yet) restores the own namespace once, which
+  can bring back transcripts deleted locally before the upgrade.
 - Two writers can still both exist (e.g. an old `ra` release). With merge-on-push they converge on the
   union instead of erasing each other, and the WARN makes it visible.
 - A just-rebuilt machine may log one false shared-writer WARN if its dead predecessor pushed less than

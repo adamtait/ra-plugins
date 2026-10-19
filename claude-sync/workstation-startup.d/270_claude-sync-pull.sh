@@ -20,9 +20,14 @@
 #     (auth, onboarding, counters); only per-project `history` arrays are
 #     unioned in from other namespaces. Foreign config is never imported.
 #
-# Our OWN namespace is always merged first, exempt from the age/cap filter
+# Our OWN namespace is restored first, exempt from the age/cap filter, when
+# this home disk hasn't restored it before (no marker under
+# ~/.ra-claude-sync/) or when `claude-sync pull` forces it
 # (docs/adr/0006-rebuild-restore-and-merge-on-push.md): with the stable
-# namespace a rebuilt workstation's previous state lives only there.
+# namespace a rebuilt workstation's previous state lives only there. On an
+# ordinary reboot the disk already holds it, so only the namespace's two
+# single files are union-merged — re-copying its directories would
+# resurrect transcripts Claude Code deliberately cleaned up.
 #
 # Progress is published to ${RUN_DIR}/pull.json so the push loop can wait
 # for the merge and `claude-sync status` can report it.
@@ -42,11 +47,6 @@ STATUS_FILE="${RUN_DIR}/pull.json"
 # shellcheck disable=SC2034  # read by resolve_ws_id in lib.sh
 WS_ID_CACHE="${USER_HOME}/.ra-claude-sync/ws-id"
 
-# shellcheck source=/dev/null
-[ -r "${ENV_FILE}" ] && set -a && . "${ENV_FILE}" && set +a
-
-[ "${RA_PLUGIN_CLAUDE_SYNC_ENABLED:-false}" = "true" ] || exit 0
-
 # Publish pull progress. $1 = state (running|done|failed); remaining
 # fields come from the globals below and are optional.
 PULL_STARTED_AT="${PULL_STARTED_AT:-$(date -u +%s)}"
@@ -64,6 +64,19 @@ write_status() {
           namespaces: $namespaces, files_restored: $files}' > "${tmp}" 2>/dev/null \
         && chmod 0644 "${tmp}" && mv -f "${tmp}" "${STATUS_FILE}" || rm -f "${tmp}"
 }
+
+# In the detached child the parent has already published "running", so
+# ANY exit from here on must overwrite it — including the early exits
+# below (env/enabled checks, log setup). The full cleanup trap replaces
+# this once the log is set up.
+if [ "${RA_CLAUDE_SYNC_PULL_DETACHED:-0}" = "1" ]; then
+    trap 'write_status failed' EXIT
+fi
+
+# shellcheck source=/dev/null
+[ -r "${ENV_FILE}" ] && set -a && . "${ENV_FILE}" && set +a
+
+[ "${RA_PLUGIN_CLAUDE_SYNC_ENABLED:-false}" = "true" ] || exit 0
 
 # --- Detach so the boot pull never blocks workstation startup ----------------
 # The cross-namespace pull can move hundreds of MB across dozens of GCS
@@ -123,9 +136,18 @@ fix_owner() {
     chown -R "${USER_NAME}:${USER_NAME}" "$@" 2>/dev/null || true
 }
 
+# This disk now holds the own namespace's state (restored, or there was
+# nothing to restore), so later boots skip re-copying its directories.
+mark_restored() {
+    mkdir -p "$(dirname "${RESTORE_MARKER}")" 2>/dev/null || true
+    date -u +%s > "${RESTORE_MARKER}" 2>/dev/null || true
+    fix_owner "$(dirname "${RESTORE_MARKER}")"
+}
+
 finish_noop() {
     log "$1"
     fix_owner "${USER_HOME}/.claude"
+    mark_restored
     PULL_STATE="done"
     exit 0
 }
@@ -140,6 +162,11 @@ BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
 select_namespace
 PLUGIN_PREFIX="gs://${BUCKET}/claude-sync"
 OWN_NS="${PLUGIN_PREFIX}/workstations/${WS_ID}/"
+RESTORE_MARKER="${USER_HOME}/.ra-claude-sync/restored-${WS_ID}"
+RESTORE_OWN=0
+if [ "${RA_CLAUDE_SYNC_RESTORE_OWN:-0}" = "1" ] || [ ! -f "${RESTORE_MARKER}" ]; then
+    RESTORE_OWN=1
+fi
 
 # Recency/age filter knobs (ADR 0004 #1). Namespaces accumulate
 # one-per-workstation forever with no GC; the cross-namespace pull cost
@@ -158,10 +185,6 @@ case "${INTERVAL}" in *[!0-9]*|"") INTERVAL=60 ;; esac
 log "starting pull as ws-id=${WS_ID} writer=${WRITER_ID} from ${PLUGIN_PREFIX} (max_age_days=${MAX_AGE_DAYS} max_namespaces=${MAX_NAMESPACES})"
 
 mkdir -p "${USER_HOME}/.claude"
-
-# Another live instance pushing to our namespace is worth knowing at boot:
-# it means `ra create` gave two workstations the same stable id.
-check_shared_writer "${PLUGIN_PREFIX}/_manifest/${WS_ID}.json" $(( INTERVAL * 3 )) || true
 
 # List namespaces. `gcloud storage ls` returns one
 # `gs://bucket/claude-sync/workstations/<ws>/` per line; an
@@ -201,6 +224,10 @@ manifest_dir="$(mktemp -d)"
 gcloud storage rsync --recursive \
     "${PLUGIN_PREFIX}/_manifest/" "${manifest_dir}/" 2>>"${LOG_FILE}" || true
 
+# Another live instance pushing to our namespace is worth knowing at boot:
+# it means `ra create` gave two workstations the same stable id.
+check_shared_writer "${manifest_dir}/${WS_ID}.json" $(( INTERVAL * 3 )) || true
+
 # Build "<epoch>\t<namespace-uri>" rows for every candidate other than our
 # own, reading each manifest from the local mirror. Then sort newest-first
 # and apply the TTL + cap.
@@ -210,7 +237,11 @@ for ns in "${NAMESPACES[@]}"; do
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
     [ -z "${ns_id}" ] && continue
     if [ "${ns_id}" = "${WS_ID}" ]; then
-        log "include ${ns_id}: own namespace (restore; exempt from age/cap filter)"
+        if [ "${RESTORE_OWN}" -eq 1 ]; then
+            log "include ${ns_id}: own namespace (restore; exempt from age/cap filter)"
+        else
+            log "include ${ns_id}: own namespace, history files only (already restored on this disk; \`claude-sync pull\` forces a full restore)"
+        fi
         PULL_NS+=("${ns}")
         continue
     fi
@@ -256,10 +287,16 @@ if [ "${PULL_NAMESPACES}" -eq 0 ]; then
     finish_noop "no eligible namespaces after age/cap filter — nothing to pull"
 fi
 
-# Stage everything into a tmpdir so the existing live tree is unaffected
-# until we cp-no-clobber / merge on top.
+# Stage each namespace into its OWN dir so the existing live tree is
+# unaffected until we cp-no-clobber / merge on top, and so one namespace's
+# copy of a file can never replace another's in the stage. (A shared stage
+# let an older foreign copy of a transcript overwrite the own namespace's
+# newer one, which the next push would then upload.) The copy below walks
+# them in PULL_NS order — own first, then others newest-first — and
+# `cp -an` keeps the first copy it sees, so own beats foreign and newer
+# beats older.
 STAGE="$(mktemp -d)"
-mkdir -p "${STAGE}/history" "${STAGE}/claudejson"
+mkdir -p "${STAGE}/history" "${STAGE}/claudejson" "${STAGE}/ns"
 
 # A missing dir counts as 0. `|| true` because find fails on it and
 # pipefail + set -e would otherwise abort the pull on a fresh disk.
@@ -267,19 +304,23 @@ count_files() { find "$1" -type f 2>/dev/null | wc -l || true; }
 local_projects_before="$(count_files "${USER_HOME}/.claude/projects")"
 own_remote_files=0
 
-for ns in "${PULL_NS[@]}"; do
+STAGED_DIRS=()
+for i in "${!PULL_NS[@]}"; do
+    ns="${PULL_NS[$i]}"
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
     [ -z "${ns_id}" ] && continue
     log "staging namespace ${ns_id}"
-    for sub in projects todos plans session-env; do
-        mkdir -p "${STAGE}/${sub}"
-        gcloud storage rsync --recursive \
-            "${ns}${sub}/" "${STAGE}/${sub}/" 2>>"${LOG_FILE}" || true
-    done
-    # Own namespace is staged first (PULL_NS order), so the stage holds
-    # exactly its files at this point.
-    if [ "${ns}" = "${OWN_NS}" ]; then
-        own_remote_files="$(count_files "${STAGE}/projects")"
+    if [ "${ns}" != "${OWN_NS}" ] || [ "${RESTORE_OWN}" -eq 1 ]; then
+        dir="${STAGE}/ns/${i}"
+        for sub in projects todos plans session-env; do
+            mkdir -p "${dir}/${sub}"
+            gcloud storage rsync --recursive \
+                "${ns}${sub}/" "${dir}/${sub}/" 2>>"${LOG_FILE}" || true
+        done
+        STAGED_DIRS+=("${dir}")
+        if [ "${ns}" = "${OWN_NS}" ]; then
+            own_remote_files="$(count_files "${dir}/projects")"
+        fi
     fi
     # Single-file, merge-on-read members: stage one copy per namespace so
     # the union merge below can fold them all in.
@@ -298,10 +339,11 @@ fi
 # no-clobber) so any newer local file wins. First-time fetches still
 # populate empty subtrees.
 for sub in projects todos plans session-env; do
-    [ -d "${STAGE}/${sub}" ] || continue
     mkdir -p "${USER_HOME}/.claude/${sub}"
     before="$(count_files "${USER_HOME}/.claude/${sub}")"
-    cp -an "${STAGE}/${sub}/." "${USER_HOME}/.claude/${sub}/" 2>>"${LOG_FILE}" || true
+    for dir in "${STAGED_DIRS[@]}"; do
+        cp -an "${dir}/${sub}/." "${USER_HOME}/.claude/${sub}/" 2>>"${LOG_FILE}" || true
+    done
     added=$(( $(count_files "${USER_HOME}/.claude/${sub}") - before ))
     PULL_FILES_RESTORED=$(( PULL_FILES_RESTORED + added ))
     if [ "${added}" -gt 0 ]; then log "restored ${added} file(s) into ${sub}/"; fi
@@ -309,13 +351,16 @@ done
 
 # Union-merge the append-only / shared single files.
 log "union-merging history.jsonl across $(ls -1 "${STAGE}/history" 2>/dev/null | wc -l) namespace(s) + local"
-merge_jsonl_history "${USER_HOME}/.claude/history.jsonl" "${STAGE}"/history/*.jsonl
+merge_jsonl_history "${USER_HOME}/.claude/history.jsonl" "${STAGE}"/history/*.jsonl \
+    || log "WARN: history.jsonl merge failed or empty; local file left as-is"
 
 log "merging .claude.json project history across $(ls -1 "${STAGE}/claudejson" 2>/dev/null | wc -l) namespace(s)"
-merge_claude_json "${USER_HOME}/.claude.json" "${STAGE}"/claudejson/*.json
+merge_claude_json "${USER_HOME}/.claude.json" "${STAGE}"/claudejson/*.json \
+    || log "WARN: .claude.json merge failed; local file left as-is"
 
 fix_owner "${USER_HOME}/.claude"
 if [ -f "${USER_HOME}/.claude.json" ]; then fix_owner "${USER_HOME}/.claude.json"; fi
 if [ -f "${WS_ID_CACHE}" ]; then fix_owner "$(dirname "${WS_ID_CACHE}")"; fi
+mark_restored
 PULL_STATE="done"
 log "done: ${PULL_NAMESPACES} namespace(s), ${PULL_FILES_RESTORED} file(s) restored"

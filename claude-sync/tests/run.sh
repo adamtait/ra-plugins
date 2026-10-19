@@ -14,7 +14,7 @@ TOOLS="${PLUGIN}/Dockerfile.d/110_claude-sync-tools.sh"
 
 # A real workstation exports the live plugin config; never let it leak in.
 for v in $(compgen -v RA_PLUGIN_CLAUDE_SYNC_) $(compgen -v RA_CLAUDE_SYNC_); do unset "${v}"; done
-export PATH="${HERE}/fake-bin:${PATH}"
+export PATH="${HERE}/fake-jq:${HERE}/fake-bin:${PATH}"
 
 NS="proj-config-0000aaaa"
 BUCKET="test-bucket"
@@ -86,6 +86,28 @@ check "pull.json done with 4 files restored" \
     jq -e '.state == "done" and .files_restored == 4 and .namespaces == 2' "${RA_CLAUDE_SYNC_RUN_DIR}/pull.json"
 teardown
 
+echo "1b. own namespace beats an older foreign copy of the same file"
+setup
+put_file "$(ns_dir "${NS}")/projects/-p/s1.jsonl" 'OWN-NEWER'
+put_file "$(ns_dir other)/projects/-p/s1.jsonl" 'FOREIGN-OLDER'
+put_manifest other "$(date -u +%s)"
+bash "${PULL}" >/dev/null 2>&1
+check "own copy restored, not the foreign one" grep -qx OWN-NEWER "${T}/home/.claude/projects/-p/s1.jsonl"
+teardown
+
+echo "1c. reboot pull doesn't resurrect deleted files; explicit pull restores"
+setup
+put_file "$(ns_dir "${NS}")/projects/-p/old.jsonl" 'old'
+put_file "$(ns_dir "${NS}")/history.jsonl" '{"display":"remote only","timestamp":3}'
+bash "${PULL}" >/dev/null 2>&1                     # first boot on this disk: restore
+rm "${T}/home/.claude/projects/-p/old.jsonl"       # Claude Code cleans it up
+bash "${PULL}" >/dev/null 2>&1                     # ordinary reboot
+check "deleted transcript stays deleted on reboot" test ! -e "${T}/home/.claude/projects/-p/old.jsonl"
+check "reboot logs history-only own namespace" log_has "history files only"
+RA_CLAUDE_SYNC_RESTORE_OWN=1 bash "${PULL}" >/dev/null 2>&1
+check "claude-sync pull (RESTORE_OWN=1) restores it" test -e "${T}/home/.claude/projects/-p/old.jsonl"
+teardown
+
 echo "2. local files always win over the remote copy"
 setup
 put_file "$(ns_dir "${NS}")/projects/-p/s1.jsonl" 'REMOTE'
@@ -99,6 +121,12 @@ setup
 rm -f "${RA_CLAUDE_SYNC_LIB}"
 bash "${PULL}" >/dev/null 2>&1
 check "pull.json failed when lib is missing" status_is failed
+teardown
+setup
+echo '{"state":"running"}' > "${RA_CLAUDE_SYNC_RUN_DIR}/pull.json"
+sed -i 's/ENABLED=true/ENABLED=false/' "${T}/env"   # child exits on the enabled check
+bash "${PULL}" >/dev/null 2>&1
+check "early child exit doesn't leave a stale running" status_is failed
 teardown
 
 echo "4. two writers on one namespace converge on the union"
@@ -131,6 +159,23 @@ own="$(ns_dir "${NS}")"
 check "retry logged" log_has "lost a race"
 check "racer line kept" grep -q racer "${own}/history.jsonl"
 check "our line kept" grep -q mine "${own}/history.jsonl"
+teardown
+
+echo "5b. a failed merge never uploads the unmerged copy; unchanged pushes are skipped"
+setup
+own="$(ns_dir "${NS}")"
+put_file "${own}/history.jsonl" '{"display":"remote 1","timestamp":1}
+{"display":"remote 2","timestamp":2}'
+put_file "${T}/home/.claude/history.jsonl" '{"display":"local","timestamp":3}'
+FAKE_JQ_FAIL_SLURP=1 bash "${LOOP}" --once >/dev/null 2>&1
+check "remote history untouched by failed merge" test "$(lines "${own}/history.jsonl")" -eq 2
+check "failure logged" log_has "merge of history.jsonl with remote failed"
+bash "${LOOP}" --once >/dev/null 2>&1
+gen_before="$(cat "${FAKE_GCS}/.gen/${BUCKET}/claude-sync/workstations/${NS}/history.jsonl")"
+bash "${LOOP}" --once >/dev/null 2>&1
+check "merged push then holds all 3 lines" test "$(lines "${own}/history.jsonl")" -eq 3
+check "an unchanged push mints no new generation" \
+    test "$(cat "${FAKE_GCS}/.gen/${BUCKET}/claude-sync/workstations/${NS}/history.jsonl")" = "${gen_before}"
 teardown
 
 echo "6. the push loop waits for the boot pull"

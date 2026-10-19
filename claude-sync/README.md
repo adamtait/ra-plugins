@@ -27,8 +27,9 @@ $ claude          # up-arrow replays A's prompts; A's transcripts, todos,
   hand a session off between machines, or review usage across all of them from one place.
 - **An allowlist, not a blob.** Exactly the six paths below are pushed each cycle; PIDs, caches, the
   npm plugin dir, and shell snapshots are excluded by design, so nothing machine-local leaks.
-- **Rebuilds restore themselves.** A rebuilt workstation reuses its namespace, and the boot pull
-  merges that namespace back first, outside the age and count limits, so a fresh disk gets its history back.
+- **Rebuilds restore themselves.** A rebuilt workstation reuses its namespace. On a fresh home disk
+  the boot pull restores that namespace first, outside the age and count limits. Ordinary reboots skip
+  it, so transcripts you deleted stay deleted.
 - **No write contention.** Each workstation writes to its own namespace prefix and the boot pull
   *union-merges* the others. Pushes of `history.jsonl` / `.claude.json` merge with the remote copy
   (generation-checked) instead of overwriting it, so even two machines on one namespace converge.
@@ -105,7 +106,7 @@ Workstation B ──┘     claude-sync/             └── Workstation D
 
 ```console
 $ claude-sync status   # bucket, namespace, loop, last pull/push, shared-writer warning
-$ claude-sync pull     # merge remote state into ~/.claude now (foreground; sudo)
+$ claude-sync pull     # merge remote state into ~/.claude now, incl. full own-namespace restore (sudo)
 $ claude-sync push     # one push cycle now (sudo)
 ```
 
