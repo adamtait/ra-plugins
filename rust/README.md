@@ -14,7 +14,8 @@ $ cargo nextest run                           # if cargo-nextest is in cargo_too
 
 - **Toolchain at first boot.** rustup installs into `~/.rustup` and `~/.cargo` on the persistent
   `/home` disk, owned by you, so `rustup update`, `rustup target add`, and `rustup toolchain install`
-  work without `sudo` and survive stop/start. The `rustup-init` binary is **SHA256-verified**.
+  work without `sudo` and survive stop/start. The `rustup-init` binary is **SHA256-verified**
+  (cargo-binstall, below, is not — see Caveats).
 - **On PATH in every shell.** Build-time symlinks in `/usr/local/bin` expose the rustup proxies
   (`cargo`, `rustc`, `rustdoc`, `rustfmt`, `cargo-fmt`, `cargo-clippy`, `clippy-driver`,
   `rust-analyzer`, `rust-gdb`, `rust-lldb`, `cargo-miri`, `rustup`) under bash, zsh, and
@@ -22,9 +23,12 @@ $ cargo nextest run                           # if cargo-nextest is in cargo_too
 - **Build dependencies baked in.** `build-essential` (the `cc` linker rustc needs), `pkg-config`,
   and `libssl-dev` (for the ubiquitous `openssl-sys` crate) are installed in the image.
 - **Cargo tools, prebuilt.** Crates in `cargo_tools` are installed with
-  [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), which downloads release binaries
-  instead of compiling (falling back to a source build when none exist). Every binary they provide
-  is linked into `/usr/local/bin` — e.g. `cargo-edit` gives you `cargo-add`, `cargo-upgrade`, ….
+  [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) into their own root,
+  `~/.local/share/ra-rust-tools`. binstall downloads the crate's own published release binaries
+  and falls back to a source build when there are none; the third-party QuickInstall build service
+  and binstall telemetry are disabled. Every binary they provide is linked into `/usr/local/bin` —
+  e.g. `cargo-edit` gives you `cargo-add`, `cargo-upgrade`, …. Entries may pin a version
+  (`cargo-nextest@0.9.80`).
 
 ## Install
 
@@ -51,7 +55,9 @@ ra plugin install ./rust
 
 Changing any of these and recreating (or restarting) the workstation applies the change on the
 next boot: a new toolchain/component/target is installed and made the default; new tools are
-installed. Nothing is removed — a previous toolchain stays installed until you
+installed. Adding a component or target to an already-installed toolchain does **not** update it.
+Nothing is removed — a tool dropped from `cargo_tools` stays installed and on PATH until you
+`cargo uninstall --root ~/.local/share/ra-rust-tools <crate>`, and — a previous toolchain stays installed until you
 `rustup toolchain uninstall` it.
 
 ## Updating
@@ -60,8 +66,8 @@ Boot does **not** auto-update a floating channel: when config is unchanged, the 
 without touching the network, so restarts stay fast. Update yourself:
 
 ```bash
-rustup update                       # toolchains
-cargo binstall cargo-nextest        # a tool (re-run to pick up a newer release)
+rustup update                                                          # toolchains
+cargo binstall --root ~/.local/share/ra-rust-tools --force cargo-nextest  # a configured tool
 ```
 
 ## PATH and `cargo install`
@@ -82,9 +88,13 @@ path=("$HOME/.cargo/bin" $path)
   `rust-analyzer`, `miri`). If install fails on a nightly, pin a dated nightly that has them.
 - **First boot takes longer** — roughly a minute or two for the toolchain, plus any `cargo_tools`
   that have no prebuilt binary and must compile.
-- **Tool install failures don't block boot.** They log a `WARNING` and are retried on the next boot.
-  Check the startup log if a tool is missing.
-- **Image binaries win.** A tool binary is not linked if `/usr/local/bin` already has a file of
-  that name that the plugin didn't create.
+- **Install failures don't block boot.** A toolchain/component failure (e.g. a typo'd component)
+  or a tool failure logs a `WARNING` and is retried on the next boot; the tool install is capped at
+  20 minutes per boot. Check the startup log if something is missing.
+- **Image binaries win.** A proxy or tool is not linked if `/usr/local/bin` already has a real file
+  of that name that the plugin didn't create.
+- **cargo-binstall is unverified.** It tracks the latest GitHub release with no checksum check
+  (like the `uv` plugin). The tools it installs come from each crate's own GitHub releases (or are
+  built from crates.io source).
 
 Design notes: [rust/docs/adr/](./docs/adr/).

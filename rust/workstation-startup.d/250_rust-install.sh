@@ -85,14 +85,42 @@ if [ ! -x "${RUSTUP_BIN}" ]; then
         --profile default --default-toolchain none
 fi
 
-# 2. The configured toolchain, components, and targets. Idempotent: rustup
-#    skips anything already present.
-install_args=(toolchain install "${TOOLCHAIN}" --profile default)
-for c in "${COMPONENTS[@]}"; do [ -n "${c}" ] && install_args+=(--component "${c}"); done
-for t in "${TARGETS[@]}"; do [ -n "${t}" ] && install_args+=(--target "${t}"); done
+# 2. The configured toolchain, components, and targets.
+comp_args=(); target_args=()
+for c in "${COMPONENTS[@]}"; do [ -n "${c}" ] && comp_args+=("${c}"); done
+for t in "${TARGETS[@]}"; do [ -n "${t}" ] && target_args+=("${t}"); done
 
-as_user "${RUSTUP_BIN}" "${install_args[@]}"
-as_user "${RUSTUP_BIN}" default "${TOOLCHAIN}"
+# If the toolchain is already installed (e.g. only components/targets changed),
+# add to it with `component add` / `target add`, which never update it.
+# `toolchain install` on an installed floating channel (stable) would also pull
+# the newest release — an unrequested ~250 MB download and compiler change at
+# boot. `toolchain list` prints full names, e.g. "stable-x86_64-unknown-linux-gnu
+# (default)" or "1.84.0-x86_64-unknown-linux-gnu".
+apply_toolchain() {
+    if as_user "${RUSTUP_BIN}" toolchain list | grep -q "^${TOOLCHAIN}-"; then
+        if [ "${#comp_args[@]}" -gt 0 ]; then
+            as_user "${RUSTUP_BIN}" component add --toolchain "${TOOLCHAIN}" "${comp_args[@]}" || return 1
+        fi
+        if [ "${#target_args[@]}" -gt 0 ]; then
+            as_user "${RUSTUP_BIN}" target add --toolchain "${TOOLCHAIN}" "${target_args[@]}" || return 1
+        fi
+    else
+        local args=(toolchain install "${TOOLCHAIN}" --profile default)
+        for c in "${comp_args[@]}"; do args+=(--component "${c}"); done
+        for t in "${target_args[@]}"; do args+=(--target "${t}"); done
+        as_user "${RUSTUP_BIN}" "${args[@]}" || return 1
+    fi
+    as_user "${RUSTUP_BIN}" default "${TOOLCHAIN}"
+}
+
+# A toolchain/component failure (typo, a nightly missing a component, network)
+# WARNs and lets boot continue rather than failing the startup sequence (see
+# docs/adr/0001). The marker is not written, so the next boot retries.
+if ! apply_toolchain; then
+    echo "[rust-install] WARNING: failed to install toolchain '${TOOLCHAIN}'" \
+        "(components: ${comp_args[*]:-none}; targets: ${target_args[*]:-none}); will retry next boot." >&2
+    exit 0
+fi
 
 echo "${config_hash}" > "${INSTALL_MARKER}"
 chown "${USER_NAME}:${USER_NAME}" "${INSTALL_MARKER}"

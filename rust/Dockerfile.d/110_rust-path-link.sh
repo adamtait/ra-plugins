@@ -23,5 +23,12 @@ CARGO_BIN="/home/user/.cargo/bin"
 
 for proxy in rustup cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy \
              clippy-driver rust-analyzer rust-gdb rust-gdbgui rust-lldb cargo-miri; do
-    ln -sf "${CARGO_BIN}/${proxy}" "/usr/local/bin/${proxy}"
+    dest="/usr/local/bin/${proxy}"
+    # Never replace a real binary an earlier image step installed; only (re)create
+    # our own links (or links left by a previous build).
+    if [ -e "${dest}" ] && [ ! -L "${dest}" ]; then
+        echo "rust plugin: ${dest} exists and is not a symlink; not linking ${proxy}." >&2
+        continue
+    fi
+    ln -sf "${CARGO_BIN}/${proxy}" "${dest}"
 done
