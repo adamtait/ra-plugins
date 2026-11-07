@@ -1,5 +1,5 @@
 name: claude-sync
-version: "1.1.0"
+version: "1.2.0"
 description: "Syncs ~/.claude/ (session history, .claude.json, CLAUDE.md memory) across cloud workstations via a GCS bucket"
 # Bucket declared in plugin.yaml; ra provisions it generically by walking
 # every installed plugin's `buckets:` declaration (no plugin-specific code
@@ -32,13 +32,15 @@ buckets:
         age_days: 365
         prefixes:
           - "claude-sync/"
-# Stable namespace (load-reduction plan #3). Opt into ra core's generic
-# stable-id injection: core derives a deterministic id from (project,
-# config_name, user_email) — stable across `ra create` rebuilds, unlike
-# the GCE instance UUID — and exports it under this env var. 270/271 prefer
-# it over resolve_ws_id(), so a rebuilt workstation reuses ONE namespace
-# instead of spawning a fresh one each create. Core hard-codes nothing; the
-# env var name lives here, in the plugin's own declaration.
+# Stable namespace STEM (load-reduction plan #3, refined by ADR 0006). Opt
+# into ra core's generic stable-id injection: core derives a deterministic id
+# from (project, config_name, user_email) — stable across `ra create`
+# rebuilds, unlike the GCE instance UUID — and exports it under this env var.
+# Core sets it on the Workstations *config*, so every workstation under one
+# config sees the same value; 270/271 therefore append the workstation
+# hostname, pushing to `<stable-id>--<hostname>` so each workstation has its
+# own single-writer namespace. Core hard-codes nothing; the env var name
+# lives here, in the plugin's own declaration.
 stable_id:
   env_var: RA_PLUGIN_CLAUDE_SYNC_NAMESPACE
 config:
@@ -66,6 +68,13 @@ config:
     type: int
     description: "Boot pull: cap the number of namespaces merged to the N most-recently-pushed"
     default: 15
+  # Periodic pull (ADR 0006). The push loop re-runs the pull every N seconds
+  # so other workstations' sessions arrive without a reboot. Surfaced as
+  # RA_PLUGIN_CLAUDE_SYNC_PULL_INTERVAL_SECONDS.
+  - name: pull_interval_seconds
+    type: int
+    description: "Seconds between periodic pulls of other workstations' sessions (0 = boot pull only)"
+    default: 600
   # Install-time only — not used by workstation scripts. When true at user-level
   # install, ra plugin install auto-sets bucket_name_override so all workstations
   # across GCP projects share one bucket. Has no runtime effect on the workstation.

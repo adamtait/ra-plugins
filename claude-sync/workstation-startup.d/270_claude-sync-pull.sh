@@ -1,80 +1,89 @@
 #!/bin/bash
-# claude-sync plugin — one-shot boot pull.
+# claude-sync plugin — install the shared helpers + pull script, then run
+# the boot pull detached.
 #
-# Pulls every workstation's namespace under gs://${BUCKET}/claude-sync/workstations/
-# and merges into /home/user/.claude/. Idempotent. Bails fast when the
-# plugin is disabled or the bucket env var is missing.
+# Materializes two files (both overwritten on every boot, so a plugin
+# upgrade takes effect on the next `ra create`):
 #
-# All claude-sync data lives under the claude-sync/ prefix inside the
-# bucket so other plugins can share the same bucket without collisions.
+#   /usr/local/lib/ra-claude-sync/common.sh  — helpers shared by the pull
+#       script and the push loop (271_*.sh): namespace resolution, the
+#       history/.claude.json union merges, and the per-file tree merge.
+#       Replaces the old "keep this identical to 271_*.sh" duplication.
+#   /usr/local/bin/ra-claude-sync-pull.sh    — merges other workstations'
+#       namespaces into /home/user/.claude/. Run here with --boot, and
+#       periodically by the push loop (pull_interval_seconds).
 #
-# Merge model (see docs/adr/0002-merge-based-sync.md):
-#   * projects/, todos/, plans/, session-env/ — namespace-scoped, UUID-
-#     named. Staged into a tmpdir, then copied into the live tree with
-#     `cp -an` so newer local files win over the GCS copy.
-#   * history.jsonl — an append-only union log; each namespace holds a
-#     partial view. UNION-MERGED: local + every namespace, torn lines
-#     dropped, deduped, sorted by timestamp. Never overwritten wholesale
-#     (that was the session-loss bug).
-#   * .claude.json — local file is authoritative for machine-local state
-#     (auth, onboarding, counters); only per-project `history` arrays are
-#     unioned in from other namespaces. Foreign config is never imported.
+# Namespace model (see docs/adr/0006-per-workstation-namespace.md): every
+# workstation pushes ONLY to its own namespace, `<stable-id>--<hostname>`.
+# The stable id alone is per-*config* (Cloud Workstations sets container env
+# on the config), so two workstations from one config used to share — and
+# overwrite — a single namespace.
+#
+# Merge model (see docs/adr/0002-merge-based-sync.md + ADR 0006):
+#   * projects/, todos/, plans/, session-env/ — per file: copy if missing
+#     locally; fast-forward if the remote copy strictly extends the local
+#     one and the local file is idle; otherwise keep local (never clobber).
+#   * history.jsonl — union-merged, written back only if the local file did
+#     not change while the merge ran.
+#   * .claude.json — boot pull only: local base + per-project history union.
+#
+# Runs as root (workstation SA auth via the metadata server).
 set -euo pipefail
 
-# --- Detach so the boot pull never blocks workstation startup ----------------
-# The cross-namespace pull can move hundreds of MB across dozens of GCS
-# namespaces and take many minutes. Run inline, it blocks the
-# /etc/workstation-startup.d/ sequence long enough that Cloud Workstations
-# tears the container down mid-boot — sshd never stabilizes and `ra connect`
-# fails with "the workstation does not have a server running on port 22".
-# Re-exec ourselves once, detached into a new session via `setsid --fork`
-# (same pattern as the push daemon in 271_*.sh), and return immediately so
-# boot completes; the pull then runs to completion in the background.
-# RA_CLAUDE_SYNC_PULL_DETACHED guards against infinite re-exec.
-if [ "${RA_CLAUDE_SYNC_PULL_DETACHED:-0}" != "1" ]; then
-    export RA_CLAUDE_SYNC_PULL_DETACHED=1
-    # Re-exec output is suppressed; capture a setsid failure so a non-running
-    # boot pull is auditable in the boot journal instead of silently no-op'ing.
-    if ! setsid --fork "$0" </dev/null >/dev/null 2>&1; then
-        echo "[claude-sync-pull] WARNING: detached re-exec of '$0' failed;" \
-             "boot pull skipped this boot" >&2
-    fi
-    exit 0
-fi
+[ -r /run/ra/env ] && set -a && . /run/ra/env && set +a
 
-USER_NAME="user"
-USER_HOME="/home/${USER_NAME}"
-LOG_FILE="/var/log/ra-claude-sync.log"
-# Last-known-good workstation id, cached on the persistent home disk so a
-# transient metadata blip can't flip our identity. See resolve_ws_id.
-WS_ID_CACHE="${USER_HOME}/.ra-claude-sync/ws-id"
+[ "${RA_PLUGIN_CLAUDE_SYNC_ENABLED:-false}" = "true" ] || exit 0
 
-# Tee both stdout and stderr through to the shared log file so a sync
-# regression leaves an auditable trail beyond the boot journal.
-mkdir -p "$(dirname "${LOG_FILE}")"
-exec > >(tee -a "${LOG_FILE}") 2>&1
+LIB_DIR="/usr/local/lib/ra-claude-sync"
+COMMON_PATH="${LIB_DIR}/common.sh"
+PULL_PATH="/usr/local/bin/ra-claude-sync-pull.sh"
 
-log() { echo "[claude-sync-pull] $(date -u +%H:%M:%S) $*"; }
+mkdir -p "${LIB_DIR}"
 
-# Resolve this workstation's stable id. Metadata is authoritative; we
-# cache the last-known-good value and prefer it over the `hostname`
-# fallback so a momentary metadata outage cannot fork our namespace
-# (the metadata name and `hostname` differ on Cloud Workstations:
-# "workstations-<uuid>" vs e.g. "personal"). Identical logic lives in the
-# push loop heredoc in 271_*.sh — keep the two in sync.
-# Returns 0 if resolved from metadata/cache, 1 if it had to use hostname.
+cat > "${COMMON_PATH}" <<'COMMON_EOF'
+# shellcheck shell=bash
+# ra claude-sync shared helpers — installed by 270_claude-sync-pull.sh.
+# Sourced by ra-claude-sync-pull.sh and ra-claude-sync-loop.sh. Set
+# LOG_TAG before sourcing to label log lines.
+#
+# Paths are overridable via RA_CLAUDE_SYNC_* env vars so the merge logic
+# can be exercised against scratch trees without touching a real home.
+
+USER_NAME="${RA_CLAUDE_SYNC_USER_NAME:-user}"
+USER_HOME="${RA_CLAUDE_SYNC_USER_HOME:-/home/${USER_NAME}}"
+LOG_FILE="${RA_CLAUDE_SYNC_LOG_FILE:-/var/log/ra-claude-sync.log}"
+# Persistent per-workstation state on the home disk (Cloud Workstations
+# only persist /home). Outside ~/.claude and off the push allowlist.
+STATE_DIR="${USER_HOME}/.ra-claude-sync"
+WS_ID_CACHE="${STATE_DIR}/ws-id"
+WS_SUFFIX_FILE="${STATE_DIR}/ws-suffix"
+# A local file modified this recently may be open in a live Claude Code
+# session; the tree merge never fast-forwards it.
+ACTIVE_WINDOW_SECONDS="${RA_CLAUDE_SYNC_ACTIVE_WINDOW_SECONDS:-120}"
+
+log() { echo "[${LOG_TAG:-claude-sync}] $(date -u +%H:%M:%S) $*"; }
+
+# GCE instance name ("workstations-<uuid>"; fresh on every `ra create`).
+# Empty when the metadata server is unreachable.
+instance_name() {
+    curl -fs -m 5 -H 'Metadata-Flavor: Google' \
+        'http://metadata.google.internal/computeMetadata/v1/instance/name' \
+        2>/dev/null || true
+}
+
+# Legacy identity, used only when RA_PLUGIN_CLAUDE_SYNC_NAMESPACE is unset:
+# metadata (authoritative) → last-known-good cache → hostname. Only
+# metadata results are cached, so a metadata blip cannot fork the
+# namespace permanently. Returns 1 if it had to fall back to hostname.
 resolve_ws_id() {
     local id="" i
     for i in 1 2 3; do
-        id="$(curl -fs -H 'Metadata-Flavor: Google' \
-            'http://metadata.google.internal/computeMetadata/v1/instance/name' \
-            2>>"${LOG_FILE}" || true)"
+        id="$(instance_name)"
         [ -n "${id}" ] && break
-        id=""
         sleep 1
     done
     if [ -n "${id}" ]; then
-        mkdir -p "$(dirname "${WS_ID_CACHE}")" 2>/dev/null || true
+        mkdir -p "${STATE_DIR}" 2>/dev/null || true
         printf '%s\n' "${id}" > "${WS_ID_CACHE}" 2>/dev/null || true
         printf '%s' "${id}"
         return 0
@@ -91,40 +100,105 @@ resolve_ws_id() {
     return 1
 }
 
-# Union-merge JSONL files into a destination, in place.
-#   $1 = destination path ; $2.. = extra source files to fold in.
-# Tolerates torn/invalid lines (fromjson? // empty), drops only exact
-# duplicate objects (`unique` — never drops a record that merely shares a
-# timestamp/sessionId with another), sorts by timestamp. The temp file is
-# created in the destination's own directory so the write-back is a true
-# atomic rename (mv across filesystems would be a non-atomic copy). Never
-# replaces the destination with an empty result (guards a jq failure from
-# wiping history).
+# Lowercase and collapse anything outside [a-z0-9_-] to '-', trimming
+# leading/trailing separators — the same rule ra core's idSafeRe applies.
+sanitize_id() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed -E 's/[^a-z0-9_-]+/-/g; s/^[-_]+//; s/[-_]+$//'
+}
+
+# Per-workstation suffix: the hostname, which on Cloud Workstations is the
+# workstation name (unique within a config, kept across restarts). If the
+# hostname is unusable, fall back to a random id persisted on the home disk.
+host_suffix() {
+    local h s
+    h="$(sanitize_id "$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)")"
+    case "${h}" in
+        ""|localhost|localhost-localdomain) ;;
+        *) printf '%s' "${h}"; return 0 ;;
+    esac
+    if [ -r "${WS_SUFFIX_FILE}" ]; then
+        s="$(head -n1 "${WS_SUFFIX_FILE}" 2>/dev/null || true)"
+        if [ -n "${s}" ]; then printf '%s' "${s}"; return 0; fi
+    fi
+    s="ws-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    mkdir -p "${STATE_DIR}" 2>/dev/null || true
+    printf '%s\n' "${s}" > "${WS_SUFFIX_FILE}" 2>/dev/null || true
+    printf '%s' "${s}"
+}
+
+# Sets WS_ID to this workstation's namespace. With the ra-core stable id:
+# `<stable-id>--<hostname>`. The stable id never contains "--" (core
+# collapses separator runs), so the double hyphen is an unambiguous join.
+resolve_namespace() {
+    if [ -n "${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE:-}" ]; then
+        WS_ID="${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE}--$(host_suffix)"
+        log "using namespace ${WS_ID} (stable id + workstation hostname)"
+    elif WS_ID="$(resolve_ws_id)"; then
+        log "using namespace ${WS_ID} (instance id; RA_PLUGIN_CLAUDE_SYNC_NAMESPACE unset)"
+    else
+        log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
+    fi
+}
+
+# Change-detection signature: size, inode, and nanosecond mtime.
+file_sig() { stat -c '%s:%i:%y' -- "$1" 2>/dev/null || echo absent; }
+
+# Atomically replace $1 with $2 only if $1 still matches signature $3.
+# The temp file inherits the destination's owner/mode first, so a file
+# Claude Code is about to append to never becomes root-owned. Returns 1
+# (and removes the temp file) if the destination changed underneath us.
+replace_if_unchanged() {
+    local dest="$1" tmp="$2" sig="$3"
+    if [ -e "${dest}" ]; then
+        chown --reference="${dest}" "${tmp}" 2>/dev/null || true
+        chmod --reference="${dest}" "${tmp}" 2>/dev/null || true
+    fi
+    if [ "$(file_sig "${dest}")" != "${sig}" ]; then
+        rm -f "${tmp}"
+        return 1
+    fi
+    mv -f "${tmp}" "${dest}"
+}
+
+# Union-merge JSONL files into $1, in place; $2.. are extra sources.
+# Drops torn/invalid lines, dedups exact objects, sorts by timestamp.
+# The temp file lives beside the destination so the write-back is an
+# atomic rename; an empty result never replaces the destination; and the
+# write-back is retried if Claude Code appended to $1 mid-merge, so a
+# periodic pull can never eat a freshly-written prompt.
 merge_jsonl_history() {
     local dest="$1"; shift
-    local -a files=()
-    [ -f "${dest}" ] && files+=("${dest}")
-    local f
-    for f in "$@"; do [ -f "${f}" ] && files+=("${f}"); done
-    [ "${#files[@]}" -gt 0 ] || return 0
-    local tmp; tmp="$(mktemp "${dest}.merge.XXXXXX")"
-    if cat "${files[@]}" 2>>"${LOG_FILE}" \
-        | jq -R -c 'fromjson? // empty | select(type=="object")' 2>>"${LOG_FILE}" \
-        | jq -s -c 'unique | sort_by(.timestamp // 0) | .[]' 2>>"${LOG_FILE}" > "${tmp}"; then
-        if [ -s "${tmp}" ]; then
-            mv -f "${tmp}" "${dest}"
+    local f attempt sig tmp
+    local -a srcs=()
+    for f in "$@"; do [ -f "${f}" ] && srcs+=("${f}"); done
+    [ "${#srcs[@]}" -gt 0 ] || return 0
+    mkdir -p "$(dirname "${dest}")"
+    for attempt in 1 2 3; do
+        sig="$(file_sig "${dest}")"
+        local -a files=("${srcs[@]}")
+        [ -f "${dest}" ] && files=("${dest}" "${srcs[@]}")
+        tmp="$(mktemp "${dest}.merge.XXXXXX")"
+        if ! cat "${files[@]}" 2>>"${LOG_FILE}" \
+            | jq -R -c 'fromjson? // empty | select(type=="object")' 2>>"${LOG_FILE}" \
+            | jq -s -c 'unique | sort_by(.timestamp // 0) | .[]' 2>>"${LOG_FILE}" > "${tmp}" \
+            || [ ! -s "${tmp}" ]; then
+            rm -f "${tmp}"
             return 0
         fi
-    fi
-    rm -f "${tmp}"
+        if replace_if_unchanged "${dest}" "${tmp}" "${sig}"; then
+            return 0
+        fi
+        log "history.jsonl changed during merge; retrying (${attempt}/3)"
+    done
+    log "WARN: history.jsonl kept changing; merge skipped this pass"
     return 0
 }
 
-# Merge .claude.json: keep the local file as the authoritative base and
-# union in only per-project `history` arrays from remote namespaces.
-#   $1 = local .claude.json (base) ; $2.. = remote claude.json files.
-# Skips any source (including the base) that is not valid JSON. Atomic,
-# validated write-back.
+# Merge .claude.json: local file is the authoritative base; only
+# per-project `history` arrays are unioned in from $2.. Invalid JSON
+# sources are skipped. Written back only if the base did not change
+# while merging (Claude Code rewrites this file frequently).
 merge_claude_json() {
     local base="$1"; shift
     [ -f "${base}" ] || return 0
@@ -136,8 +210,9 @@ merge_claude_json() {
         jq -e . "${f}" >/dev/null 2>&1 && rfiles+=("${f}")
     done
     [ "${#rfiles[@]}" -gt 0 ] || return 0
-    # Temp in the destination's own directory → atomic rename on write-back.
-    local tmp; tmp="$(mktemp "${base}.merge.XXXXXX")"
+    local sig tmp
+    sig="$(file_sig "${base}")"
+    tmp="$(mktemp "${base}.merge.XXXXXX")"
     if jq -s '
         # order-preserving unique (history entries have no timestamp to sort by)
         def dedup_keep_order: reduce .[] as $x ([]; if any(.[]; . == $x) then . else . + [$x] end);
@@ -151,15 +226,118 @@ merge_claude_json() {
                   else . end
             )
           )
-    ' "${base}" "${rfiles[@]}" > "${tmp}" 2>>"${LOG_FILE}"; then
-        if [ -s "${tmp}" ] && jq -e . "${tmp}" >/dev/null 2>&1; then
-            mv -f "${tmp}" "${base}"
-            return 0
-        fi
+    ' "${base}" "${rfiles[@]}" > "${tmp}" 2>>"${LOG_FILE}" \
+        && [ -s "${tmp}" ] && jq -e . "${tmp}" >/dev/null 2>&1; then
+        replace_if_unchanged "${base}" "${tmp}" "${sig}" \
+            || log ".claude.json changed during merge; skipped this pass"
+        return 0
     fi
     rm -f "${tmp}"
     return 0
 }
+
+# Merge one staged tree ($1, a namespace's mirror of e.g. projects/) into
+# the live tree ($2), file by file:
+#   * missing locally            → copy in
+#   * remote strictly extends the local file (local is a byte prefix of
+#     remote) and the local file is idle → fast-forward (atomic replace)
+#   * remote larger but diverged → keep local, logged
+#   * equal or smaller remote    → keep local silently (normal: local ahead)
+# Never deletes and never overwrites a diverged or active local file.
+#
+# Sizes for both trees come from one `find -printf` each, so the common
+# case (nothing changed) costs no per-file process spawns — a history of
+# thousands of transcripts is re-merged every pull_interval_seconds.
+merge_tree() {
+    local src="$1" dest="$2"
+    [ -d "${src}" ] || return 0
+    mkdir -p "${dest}"
+    local now rec f rel d rsize lsize mtime sig tmp
+    local copied=0 forwarded=0 kept=0
+    local -A local_size=()
+    now="$(date +%s)"
+    while IFS= read -r -d '' rec; do
+        local_size["${rec#* }"]="${rec%% *}"
+    done < <(find "${dest}" -type f -printf '%s %P\0')
+    while IFS= read -r -d '' rec; do
+        rsize="${rec%% *}"
+        rel="${rec#* }"
+        f="${src}/${rel}"
+        d="${dest}/${rel}"
+        lsize="${local_size["${rel}"]-}"
+        if [ -z "${lsize}" ]; then
+            # Missing locally (or present but not a regular file, which
+            # the bulk no-clobber copy below leaves alone).
+            [ -e "${d}" ] || copied=$((copied + 1))
+            continue
+        fi
+        [ "${rsize}" -gt "${lsize}" ] || continue
+        mtime="$(stat -c %Y -- "${d}")"
+        if [ $((now - mtime)) -lt "${ACTIVE_WINDOW_SECONDS}" ]; then
+            log "skip-active ${rel}: modified locally $((now - mtime))s ago"
+            kept=$((kept + 1))
+            continue
+        fi
+        sig="$(file_sig "${d}")"
+        if cmp -s -n "${lsize}" -- "${d}" "${f}"; then
+            tmp="${d}.ra-sync.$$"
+            if cp -- "${f}" "${tmp}" 2>>"${LOG_FILE}" \
+                && replace_if_unchanged "${d}" "${tmp}" "${sig}"; then
+                log "fast-forward ${rel} (${lsize} -> ${rsize} bytes)"
+                forwarded=$((forwarded + 1))
+            else
+                rm -f "${tmp}"
+                log "skip ${rel}: changed locally during fast-forward"
+                kept=$((kept + 1))
+            fi
+        else
+            log "keep-local ${rel}: diverged from remote (local=${lsize} remote=${rsize} bytes)"
+            kept=$((kept + 1))
+        fi
+    done < <(find "${src}" -type f -printf '%s %P\0')
+    # Copy every missing file in one no-clobber pass (new files are
+    # UUID-named, so nothing local is racing to create them). Ownership is
+    # fixed by the pull's final chown.
+    if [ "${copied}" -gt 0 ]; then
+        cp -rn --preserve=mode,timestamps -- "${src}/." "${dest}/" 2>>"${LOG_FILE}" || true
+    fi
+    log "merged ${src}: ${copied} new, ${forwarded} fast-forwarded, ${kept} kept local"
+}
+COMMON_EOF
+chmod 0644 "${COMMON_PATH}"
+
+cat > "${PULL_PATH}" <<'PULL_EOF'
+#!/bin/bash
+# ra-claude-sync pull — installed by 270_claude-sync-pull.sh.
+#
+# Merges other workstations' namespaces from
+# gs://${BUCKET}/claude-sync/workstations/ into /home/user/.claude/.
+#
+#   ra-claude-sync-pull.sh --boot   boot pull (270_*.sh): also merges our
+#                                   OWN namespace (restores history after a
+#                                   rebuild under the same name) and
+#                                   .claude.json; logs to the log file.
+#   ra-claude-sync-pull.sh          periodic pull (push loop): other
+#                                   namespaces + history.jsonl only;
+#                                   output goes to the caller's stdout.
+#
+# Namespaces are mirrored incrementally into /var/cache/ra-claude-sync/
+# (ephemeral — the first pull after a restart is a full download), then
+# merged per file by merge_tree (common.sh). A lock keeps the boot pull and
+# a periodic pull from overlapping.
+set -euo pipefail
+
+LOG_TAG="claude-sync-pull"
+# shellcheck source=/dev/null
+. "${RA_CLAUDE_SYNC_COMMON:-/usr/local/lib/ra-claude-sync/common.sh}"
+
+BOOT=0
+[ "${1:-}" = "--boot" ] && BOOT=1
+
+if [ "${BOOT}" -eq 1 ]; then
+    mkdir -p "$(dirname "${LOG_FILE}")"
+    exec >> "${LOG_FILE}" 2>&1
+fi
 
 [ -r /run/ra/env ] && set -a && . /run/ra/env && set +a
 
@@ -169,62 +347,41 @@ if [ -z "${RA_PLUGIN_CLAUDE_SYNC_BUCKET:-}" ]; then
     exit 0
 fi
 
-BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
+CACHE_DIR="${RA_CLAUDE_SYNC_CACHE_DIR:-/var/cache/ra-claude-sync}"
+MIRROR_DIR="${CACHE_DIR}/mirror"
+MANIFEST_DIR="${CACHE_DIR}/manifest"
+LOCK_FILE="${RA_CLAUDE_SYNC_PULL_LOCK:-/run/ra-claude-sync.pull.lock}"
+mkdir -p "${MIRROR_DIR}" "${MANIFEST_DIR}" "$(dirname "${LOCK_FILE}")"
 
-# Namespace selection (load-reduction plan #3). When `ra create` injected
-# RA_PLUGIN_CLAUDE_SYNC_NAMESPACE — a stable id derived from (project,
-# config_name, user_email) — prefer it so a rebuilt workstation reuses ONE
-# namespace instead of spawning a fresh UUID namespace every create. Fall
-# back to resolve_ws_id() (metadata / cached / hostname) only when the env
-# var is unset, preserving the pre-#3 behavior. Keep this block in sync
-# with the identical selection in 271_*.sh.
-if [ -n "${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE:-}" ]; then
-    WS_ID="${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE}"
-    log "using stable namespace from RA_PLUGIN_CLAUDE_SYNC_NAMESPACE=${WS_ID}"
-else
-    WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+    log "another pull is already running; skipping this one"
+    exit 0
 fi
-PLUGIN_PREFIX="gs://${BUCKET}/claude-sync"
 
-# Recency/age filter knobs (load-reduction plan #1). Namespaces accumulate
-# one-per-workstation forever with no GC; the cross-namespace pull cost
-# grew unbounded. We rank candidate namespaces by their manifest's
-# last_push_at_epoch, then pull only those active within MAX_AGE_DAYS AND
-# cap to the MAX_NAMESPACES most recent. Both are configurable via plugin
-# config; defaults below match docs/adr/0004-load-reduction.md.
+BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
+PLUGIN_PREFIX="gs://${BUCKET}/claude-sync"
+resolve_namespace
+
+# Recency/age filter (ADR 0004 #1): rank other namespaces by manifest
+# last_push_at_epoch; keep those newer than MAX_AGE_DAYS and within the
+# MAX_NAMESPACES most recent.
 MAX_AGE_DAYS="${RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_AGE_DAYS:-30}"
 MAX_NAMESPACES="${RA_PLUGIN_CLAUDE_SYNC_PULL_MAX_NAMESPACES:-15}"
 case "${MAX_AGE_DAYS}" in *[!0-9]*|"") MAX_AGE_DAYS=30 ;; esac
 case "${MAX_NAMESPACES}" in *[!0-9]*|"") MAX_NAMESPACES=15 ;; esac
 
-log "starting pull as ws-id=${WS_ID} from ${PLUGIN_PREFIX} (max_age_days=${MAX_AGE_DAYS} max_namespaces=${MAX_NAMESPACES})"
+mode="periodic"; [ "${BOOT}" -eq 1 ] && mode="boot"
+log "starting ${mode} pull as ws-id=${WS_ID} from ${PLUGIN_PREFIX} (max_age_days=${MAX_AGE_DAYS} max_namespaces=${MAX_NAMESPACES})"
 
 mkdir -p "${USER_HOME}/.claude"
 
-# List namespaces. `gcloud storage ls` returns one
-# `gs://bucket/claude-sync/workstations/<ws>/` per line; an
-# empty/nonexistent prefix is not an error here.
 mapfile -t NAMESPACES < <(gcloud storage ls "${PLUGIN_PREFIX}/workstations/" 2>>"${LOG_FILE}" | sort -u || true)
-
 if [ "${#NAMESPACES[@]}" -eq 0 ]; then
     log "no namespaces under ${PLUGIN_PREFIX}/workstations/ — first boot"
-    chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.claude"
     exit 0
 fi
 
-# --- Recency/age-filtered + capped namespace selection (plan #1) -------------
-# Without GC, every past `ra create` leaves an ~85 MB namespace behind, so
-# an unfiltered pull rsyncs gigabytes across dozens of dead namespaces on
-# every boot. Rank by each manifest's last_push_at_epoch and pull only the
-# namespaces that are (a) newer than MAX_AGE_DAYS and (b) within the
-# MAX_NAMESPACES most-recent. Our own WS_ID is always skipped (we push it,
-# never pull it). A missing/invalid manifest is treated as epoch 0 — the
-# oldest possible — so undated namespaces fall off first and never crowd
-# out a dated, active one. Every exclusion is logged; nothing is silently
-# truncated.
-#
-# now/cutoff in epoch seconds; cutoff=0 disables the age gate when
-# MAX_AGE_DAYS=0 (cap-only mode).
 now_epoch="$(date -u +%s)"
 if [ "${MAX_AGE_DAYS}" -gt 0 ]; then
     cutoff_epoch=$(( now_epoch - MAX_AGE_DAYS * 86400 ))
@@ -232,55 +389,50 @@ else
     cutoff_epoch=0
 fi
 
-# Fetch all namespace manifests in ONE gcloud round-trip instead of one
-# `gcloud storage cat` per namespace — ranking N namespaces otherwise pays
-# N gcloud cold-starts (tens of seconds, and N chances to flake). Mirror
-# them locally, best-effort: a namespace whose manifest is missing or
-# unreadable falls through to epoch 0 below (treated as oldest), as before.
-manifest_dir="$(mktemp -d)"
+# All manifests in one gcloud round-trip, mirrored incrementally. A
+# missing/unreadable manifest ranks as epoch 0 (oldest).
 gcloud storage rsync --recursive \
-    "${PLUGIN_PREFIX}/_manifest/" "${manifest_dir}/" 2>>"${LOG_FILE}" || true
+    "${PLUGIN_PREFIX}/_manifest/" "${MANIFEST_DIR}/" 2>>"${LOG_FILE}" || true
 
-# Build "<epoch>\t<namespace-uri>" rows for every candidate (excluding our
-# own namespace), reading each manifest from the local mirror. Then sort
-# newest-first and apply the TTL + cap.
+PULL_NS=()
 ranked_rows=""
 for ns in "${NAMESPACES[@]}"; do
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
     [ -z "${ns_id}" ] && continue
     if [ "${ns_id}" = "${WS_ID}" ]; then
-        log "skip ${ns_id}: own namespace (push-only)"
+        # Our own namespace is merged only at boot (to restore a rebuilt
+        # workstation's history). Periodically it holds nothing we don't
+        # already have locally, and re-mirroring it would re-download every
+        # file we just pushed.
+        if [ "${BOOT}" -eq 1 ]; then
+            log "include ${ns_id}: own namespace (boot restore)"
+            PULL_NS+=("${ns}")
+        fi
         continue
     fi
-    ts="$(jq -r '.last_push_at_epoch // 0' "${manifest_dir}/${ns_id}.json" 2>>"${LOG_FILE}" || echo 0)"
+    ts="$(jq -r '.last_push_at_epoch // 0' "${MANIFEST_DIR}/${ns_id}.json" 2>/dev/null || echo 0)"
     ts="${ts:-0}"
     case "${ts}" in *[!0-9]*) ts=0 ;; esac
     ranked_rows+="${ts}	${ns}"$'\n'
 done
-rm -rf "${manifest_dir}"
 
-# Sort by epoch descending (newest first). `sort -rn` keys on the leading
-# numeric epoch field; the tab-separated URI rides along untouched.
 mapfile -t ranked_sorted < <(printf '%s' "${ranked_rows}" | sort -rn -k1,1 | sed '/^$/d')
 
-PULL_NS=()
 kept=0
 for row in "${ranked_sorted[@]}"; do
     ts="${row%%	*}"
     ns="${row#*	}"
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
-    # Age gate (skipped when cutoff_epoch=0). ts=0 (missing/invalid
-    # manifest) always fails a non-zero cutoff, so undated namespaces are
-    # dropped first — exactly the intended "oldest" treatment.
     if [ "${cutoff_epoch}" -gt 0 ] && [ "${ts}" -lt "${cutoff_epoch}" ]; then
-        if [ "${ts}" -eq 0 ]; then
-            log "skip ${ns_id}: no/invalid manifest (treated as oldest, beyond ${MAX_AGE_DAYS}d TTL)"
-        else
-            log "skip ${ns_id}: last_push_at_epoch=${ts} older than ${MAX_AGE_DAYS}d TTL (cutoff=${cutoff_epoch})"
+        if [ "${BOOT}" -eq 1 ]; then
+            if [ "${ts}" -eq 0 ]; then
+                log "skip ${ns_id}: no/invalid manifest (treated as oldest, beyond ${MAX_AGE_DAYS}d TTL)"
+            else
+                log "skip ${ns_id}: last_push_at_epoch=${ts} older than ${MAX_AGE_DAYS}d TTL (cutoff=${cutoff_epoch})"
+            fi
         fi
         continue
     fi
-    # Recency cap.
     if [ "${kept}" -ge "${MAX_NAMESPACES}" ]; then
         log "skip ${ns_id}: beyond top-${MAX_NAMESPACES} recency cap (last_push_at_epoch=${ts})"
         continue
@@ -289,51 +441,74 @@ for row in "${ranked_sorted[@]}"; do
     kept=$((kept + 1))
 done
 
-log "selected ${kept} of ${#NAMESPACES[@]} namespace(s) for pull"
-if [ "${kept}" -eq 0 ]; then
+log "selected ${#PULL_NS[@]} of ${#NAMESPACES[@]} namespace(s) for pull"
+if [ "${#PULL_NS[@]}" -eq 0 ]; then
     log "no eligible namespaces after age/cap filter — nothing to pull"
-    chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.claude"
     exit 0
 fi
 
-# Stage everything into a tmpdir so the existing live tree is unaffected
-# until we cp-no-clobber / merge on top.
-STAGE="$(mktemp -d)"
-trap 'rm -rf "${STAGE}"' EXIT
-mkdir -p "${STAGE}/history" "${STAGE}/claudejson"
-
+# Mirror each selected namespace, then merge it into the live tree.
+history_srcs=()
+claudejson_srcs=()
 for ns in "${PULL_NS[@]}"; do
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
-    [ -z "${ns_id}" ] && continue
-    log "staging namespace ${ns_id}"
+    m="${MIRROR_DIR}/${ns_id}"
+    mkdir -p "${m}"
     for sub in projects todos plans session-env; do
-        mkdir -p "${STAGE}/${sub}"
+        mkdir -p "${m}/${sub}"
         gcloud storage rsync --recursive \
-            "${ns}${sub}/" "${STAGE}/${sub}/" 2>>"${LOG_FILE}" || true
+            "${ns}${sub}/" "${m}/${sub}/" 2>>"${LOG_FILE}" || true
+        merge_tree "${m}/${sub}" "${USER_HOME}/.claude/${sub}"
     done
-    # Single-file, merge-on-read members: stage one copy per namespace so
-    # the union merge below can fold them all in.
-    gcloud storage cp "${ns}history.jsonl" "${STAGE}/history/${ns_id}.jsonl" 2>>"${LOG_FILE}" || true
-    gcloud storage cp "${ns}claude.json"   "${STAGE}/claudejson/${ns_id}.json" 2>>"${LOG_FILE}" || true
+    # Single-file members: one copy per namespace, folded in below. A
+    # failed fetch drops the stale mirror copy rather than re-merging it.
+    gcloud storage cp "${ns}history.jsonl" "${m}/history.jsonl" 2>>"${LOG_FILE}" \
+        || rm -f "${m}/history.jsonl"
+    history_srcs+=("${m}/history.jsonl")
+    if [ "${BOOT}" -eq 1 ]; then
+        gcloud storage cp "${ns}claude.json" "${m}/claude.json" 2>>"${LOG_FILE}" \
+            || rm -f "${m}/claude.json"
+        claudejson_srcs+=("${m}/claude.json")
+    fi
 done
 
-# Merge staged directory content into ~/.claude using `cp -an` (archive +
-# no-clobber) so any newer local file wins. First-time fetches still
-# populate empty subtrees.
-for sub in projects todos plans session-env; do
-    [ -d "${STAGE}/${sub}" ] || continue
-    mkdir -p "${USER_HOME}/.claude/${sub}"
-    cp -an "${STAGE}/${sub}/." "${USER_HOME}/.claude/${sub}/" 2>>"${LOG_FILE}" || true
-done
+log "union-merging history.jsonl across ${#history_srcs[@]} namespace(s) + local"
+merge_jsonl_history "${USER_HOME}/.claude/history.jsonl" "${history_srcs[@]}"
 
-# Union-merge the append-only / shared single files.
-log "union-merging history.jsonl across $(ls -1 "${STAGE}/history" 2>/dev/null | wc -l) namespace(s) + local"
-merge_jsonl_history "${USER_HOME}/.claude/history.jsonl" "${STAGE}"/history/*.jsonl
+if [ "${BOOT}" -eq 1 ]; then
+    log "merging .claude.json project history across ${#claudejson_srcs[@]} namespace(s)"
+    merge_claude_json "${USER_HOME}/.claude.json" "${claudejson_srcs[@]}"
+fi
 
-log "merging .claude.json project history across $(ls -1 "${STAGE}/claudejson" 2>/dev/null | wc -l) namespace(s)"
-merge_claude_json "${USER_HOME}/.claude.json" "${STAGE}"/claudejson/*.json
+# Drop mirrors of namespaces that aged out of the selection so the cache
+# tracks the working set. Only at boot: a periodic pull deliberately skips
+# our own namespace, and must not throw away its mirror.
+if [ "${BOOT}" -eq 1 ]; then
+    for d in "${MIRROR_DIR}"/*/; do
+        [ -d "${d}" ] || continue
+        id="$(basename "${d}")"
+        keep=0
+        for ns in "${PULL_NS[@]}"; do
+            ns_id="${ns%/}"; ns_id="${ns_id##*/}"
+            [ "${ns_id}" = "${id}" ] && { keep=1; break; }
+        done
+        [ "${keep}" -eq 1 ] || rm -rf "${d}"
+    done
+fi
 
-chown -R "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.claude"
-[ -f "${USER_HOME}/.claude.json" ] && chown "${USER_NAME}:${USER_NAME}" "${USER_HOME}/.claude.json"
-[ -f "${WS_ID_CACHE}" ] && chown -R "${USER_NAME}:${USER_NAME}" "$(dirname "${WS_ID_CACHE}")" 2>/dev/null || true
-log "done"
+chown -R "${USER_NAME}:" "${USER_HOME}/.claude" 2>/dev/null || true
+[ -f "${USER_HOME}/.claude.json" ] && chown "${USER_NAME}:" "${USER_HOME}/.claude.json" 2>/dev/null || true
+[ -d "${STATE_DIR}" ] && chown -R "${USER_NAME}:" "${STATE_DIR}" 2>/dev/null || true
+log "done (${mode})"
+PULL_EOF
+chmod 0755 "${PULL_PATH}"
+
+# Detach the boot pull so it never blocks the workstation-startup.d
+# sequence: a multi-GB pull run inline once kept sshd from stabilizing
+# and Cloud Workstations tore the container down mid-boot. The pull
+# script logs to the log file itself under --boot.
+if ! setsid --fork "${PULL_PATH}" --boot </dev/null >/dev/null 2>&1; then
+    echo "[claude-sync-pull] WARNING: detached boot pull failed to start;" \
+         "boot pull skipped this boot" >&2
+fi
+exit 0
