@@ -39,6 +39,10 @@ Injection is gated on the plugin being enabled. Both scripts prefer this env var
 and fall back to the metadata/cache/hostname chain (ADR 0002) only when it is unset. A rebuilt
 workstation now reuses one namespace instead of minting a new one.
 
+> **Refined by [ADR 0006](./0006-per-workstation-namespace.md):** the injected id is per *config*, so
+> workstations sharing a config collided in one namespace. It is now the stem of
+> `<stable-id>--<hostname>`.
+
 ### #4 — Bucket Object Lifecycle Management (`plugin.yaml` + `ra` core)
 
 The `state` bucket declares two lifecycle rules via a generic `buckets[].lifecycle:` field, both scoped

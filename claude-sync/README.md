@@ -4,7 +4,8 @@
 
 A [`remote-agent`](https://github.com/adamtait/remote-agent) plugin that syncs `~/.claude/` across
 cloud workstations sharing a `(GCP project, git user email)` pair. Each workstation pushes its state
-to a private GCS bucket on a short loop; on boot, every other workstation's state is merged back in.
+to a private GCS bucket on a short loop; at boot and every few minutes after, every other workstation's
+state is merged back in.
 
 ```console
 $ ra plugin install https://github.com/adamtait/ra-plugins claude-sync
@@ -27,8 +28,9 @@ $ claude          # up-arrow replays A's prompts; A's transcripts, todos,
   hand a session off between machines, or review usage across all of them from one place.
 - **An allowlist, not a blob.** Exactly the six paths below are pushed each cycle; PIDs, caches, the
   npm plugin dir, and shell snapshots are excluded by design, so nothing machine-local leaks.
-- **No write contention.** Each workstation writes only to its own namespace prefix and the boot pull
-  *union-merges* every other namespace, so parallel machines never clobber each other's history.
+- **No write contention.** Each workstation, including several from the same config, writes only to
+  its own namespace (`<stable-id>--<hostname>`), and the pull *merges* every other namespace at boot
+  and every `pull_interval_seconds`, so parallel machines never clobber each other's history.
 - **Bounded growth, logged — not silently capped.** The boot pull merges only namespaces pushed
   within `pull_max_age_days` and caps at the `pull_max_namespaces` most recent; GCS lifecycle rules
   demote data to Coldline at 90 days and delete at 365. Every exclusion is logged as `skip <ns>: <reason>`.
@@ -77,11 +79,18 @@ Workstation B ──┘     claude-sync/             └── Workstation D
                         _manifest/<ws-id>.json
 ```
 
-- Each workstation pushes only to `claude-sync/workstations/<ws-id>/` → no concurrent-write contention.
-- Boot pull merges every other namespace into `~/.claude/`: directory trees via `cp -an` (newer local
-  files win), `history.jsonl` via union-merge, `.claude.json` via local-base + per-project history union.
-- `_manifest/<ws-id>.json` carries `last_push_at_epoch`, advanced only on a fully successful push cycle,
-  and drives the boot pull's recency ranking.
+- `<ws-id>` is `<stable-id>--<hostname>`: the ra-core stable id (per project + config + user) plus the
+  workstation name, so every workstation, even several from one config, has its own namespace.
+- Each workstation pushes only to its own namespace → exactly one writer per namespace. A loop that
+  finds another live instance already writing its namespace exits with `ERROR namespace collision`
+  instead of overwriting it.
+- The pull (at boot, then every `pull_interval_seconds`) mirrors other namespaces incrementally into
+  `/var/cache/ra-claude-sync/` and merges per file: missing files are copied in; a transcript that
+  grew on another machine is fast-forwarded if the local copy is an idle prefix of it; anything
+  diverged keeps the local copy. `history.jsonl` is union-merged; `.claude.json` (boot only) takes
+  per-project history from other machines on top of the local file.
+- `_manifest/<ws-id>.json` carries `last_push_at_epoch` (advanced only on a fully successful push
+  cycle; drives the pull's recency ranking) and `writer_host` / `writer_instance`.
 
 ## Configuration
 
@@ -93,6 +102,7 @@ Workstation B ──┘     claude-sync/             └── Workstation D
 | `sync_all_projects`    | bool   | `false`                     | User-level install only. Points every project's workstations at one shared bucket. |
 | `pull_max_age_days`    | int    | `30`                        | Boot pull merges only namespaces pushed within N days. `0` = cap-only. |
 | `pull_max_namespaces`  | int    | `15`                        | Boot pull caps the merge to the N most-recently-pushed namespaces.    |
+| `pull_interval_seconds`| int    | `600`                       | Periodic pull cadence from the push loop. `0` = boot pull only.       |
 
 ## Operations
 
@@ -102,8 +112,13 @@ Workstation B ──┘     claude-sync/             └── Workstation D
   production; `systemctl status` reporting "Failed to connect to bus" there is expected, not the bug.
 - **Restart the loop**: re-run `/etc/workstation-startup.d/271_claude-sync-daemon.sh` as root
   (idempotent — SIGTERM the PID in `/run/ra-claude-sync.pid`, then relaunch).
-- **Manual push / pull**: run `/usr/local/bin/ra-claude-sync-loop.sh` (Ctrl-C to stop), or re-run
-  `/etc/workstation-startup.d/270_claude-sync-pull.sh` as root.
+- **Manual push / pull**: run `/usr/local/bin/ra-claude-sync-loop.sh` (Ctrl-C to stop), or run
+  `/usr/local/bin/ra-claude-sync-pull.sh` as root (add `--boot` to also restore your own namespace and
+  merge `.claude.json`).
+- **Which namespace am I?** `grep 'using namespace' /var/log/ra-claude-sync.log | tail -1`.
+- **`ERROR namespace collision`** in the log means another live workstation is pushing to this
+  workstation's namespace (same config *and* same hostname). The loop refuses to push rather than
+  overwrite it; rename one workstation or stop the other loop. See ADR 0006.
 - **Inspect a namespace**: `gcloud storage ls gs://<bucket>/claude-sync/workstations/<ws-id>/projects/`.
 
 ### Storage lifecycle
@@ -135,8 +150,11 @@ results, pasted content — and flow verbatim into the GCS bucket.
 - Up to `interval_seconds` of state can be lost if a workstation is killed between push cycles.
 - `gcloud storage rsync` re-uploads whole files on any byte change — a 50 MB session JSONL re-uploads
   fully each cycle. v2 plans a delta-append approach.
-- Parallel `CLAUDE.md` memory edits on two workstations resolve by last-merge-order on pull; no
-  conflict UI yet.
+- A file changed on two workstations (e.g. the same session continued on both, or parallel memory
+  edits) diverges: each workstation keeps its own copy and the pull logs `keep-local` each interval.
+  No conflict UI yet.
+- A large transcript that is still growing on another workstation is re-downloaded whole on each
+  pull; GCS has no partial-object sync.
 - `.claude.json` merge can create a project entry holding only a `history` array for projects you've
   never opened here (so up-arrow history works when you first `cd` in); Claude fills the rest with defaults.
 
