@@ -171,19 +171,12 @@ fi
 
 BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
 
-# Namespace selection (load-reduction plan #3). When `ra create` injected
-# RA_PLUGIN_CLAUDE_SYNC_NAMESPACE — a stable id derived from (project,
-# config_name, user_email) — prefer it so a rebuilt workstation reuses ONE
-# namespace instead of spawning a fresh UUID namespace every create. Fall
-# back to resolve_ws_id() (metadata / cached / hostname) only when the env
-# var is unset, preserving the pre-#3 behavior. Keep this block in sync
-# with the identical selection in 271_*.sh.
-if [ -n "${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE:-}" ]; then
-    WS_ID="${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE}"
-    log "using stable namespace from RA_PLUGIN_CLAUDE_SYNC_NAMESPACE=${WS_ID}"
-else
-    WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
-fi
+# Namespace = this workstation instance's own id, never a shared one
+# (docs/adr/0007-unique-workstation-identifiers.md). RA_PLUGIN_CLAUDE_SYNC_NAMESPACE
+# — the per-config id older `ra create` runs inject — is deliberately ignored:
+# every workstation on a config would share it and overwrite each other.
+# Keep this in sync with the identical selection in 271_*.sh.
+WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
 PLUGIN_PREFIX="gs://${BUCKET}/claude-sync"
 
 # Recency/age filter knobs (load-reduction plan #1). Namespaces accumulate
