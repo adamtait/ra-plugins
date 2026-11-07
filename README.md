@@ -52,6 +52,7 @@ $ ra create
 | [github](./github/) | GitHub CLI + PAT git credential helper; optional repo auto-clone |
 | [marimo](./marimo/) | Reactive Python notebook server, auto-started at boot |
 | [pulumi](./pulumi/) | Pulumi IaC CLI; optional Pulumi Cloud login via access token |
+| [rust](./rust/) | Rust toolchain via rustup (cargo, clippy, rustfmt), plus optional components, targets, and cargo tools |
 | [terraform](./terraform/) | HashiCorp Terraform CLI |
 | [tmux](./tmux/) | tmux — a persistent named session at boot, auto-attached on login |
 | [uv](./uv/) | `uv` — a fast Python package and project manager |
