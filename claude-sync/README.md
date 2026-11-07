@@ -59,8 +59,9 @@ to reuse. The next `ra create` will, idempotently:
 
 1. Create the bucket `ra-<project>-<sha1(git-user-email)[:8]>` (or your `bucket_name_override`).
 2. Bind `roles/storage.objectAdmin` on it to the workstation service account.
-3. Inject `RA_PLUGIN_CLAUDE_SYNC_BUCKET` and a stable `RA_PLUGIN_CLAUDE_SYNC_NAMESPACE` so a rebuilt
-   workstation reuses one namespace instead of spawning a fresh ~85 MB one each create.
+3. Inject `RA_PLUGIN_CLAUDE_SYNC_BUCKET`. Each workstation pushes to its own namespace, named after
+   the workstation instance and never reused (a rebuild starts a new one; its history comes back
+   through the pull, [ADR 0007](docs/adr/0007-unique-workstation-identifiers.md)).
 4. Apply the bucket's GCS Object Lifecycle rules (see [Storage lifecycle](#storage-lifecycle)).
 
 claude-sync syncs files created by the [`claude`](../claude/) plugin (or a manual Claude Code
