@@ -82,8 +82,8 @@ Workstation B ──┘     claude-sync/             └── Workstation D
 - `<ws-id>` is `<stable-id>--<hostname>`: the ra-core stable id (per project + config + user) plus the
   workstation name, so every workstation, even several from one config, has its own namespace.
 - Each workstation pushes only to its own namespace → exactly one writer per namespace. A loop that
-  finds another live instance already writing its namespace exits with `ERROR namespace collision`
-  instead of overwriting it.
+  finds another live instance already writing its namespace logs `ERROR namespace collision`
+  and waits until that instance goes quiet instead of overwriting it.
 - The pull (at boot, then every `pull_interval_seconds`) mirrors other namespaces incrementally into
   `/var/cache/ra-claude-sync/` and merges per file: missing files are copied in; a transcript that
   grew on another machine is fast-forwarded if the local copy is an idle prefix of it; anything
@@ -117,8 +117,8 @@ Workstation B ──┘     claude-sync/             └── Workstation D
   merge `.claude.json`).
 - **Which namespace am I?** `grep 'using namespace' /var/log/ra-claude-sync.log | tail -1`.
 - **`ERROR namespace collision`** in the log means another live workstation is pushing to this
-  workstation's namespace (same config *and* same hostname). The loop refuses to push rather than
-  overwrite it; rename one workstation or stop the other loop. See ADR 0006.
+  workstation's namespace (same config *and* same hostname). The loop holds off pushing, re-checking
+  every 3 intervals, rather than overwrite it; rename one workstation or stop the other loop. See ADR 0006.
 - **Inspect a namespace**: `gcloud storage ls gs://<bucket>/claude-sync/workstations/<ws-id>/projects/`.
 
 ### Storage lifecycle

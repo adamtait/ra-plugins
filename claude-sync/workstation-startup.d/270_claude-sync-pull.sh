@@ -57,6 +57,15 @@ LOG_FILE="${RA_CLAUDE_SYNC_LOG_FILE:-/var/log/ra-claude-sync.log}"
 STATE_DIR="${USER_HOME}/.ra-claude-sync"
 WS_ID_CACHE="${STATE_DIR}/ws-id"
 WS_SUFFIX_FILE="${STATE_DIR}/ws-suffix"
+# Scratch space for fast-forward temp files: on the home disk (same
+# filesystem as ~/.claude, so renames are atomic) but outside the pushed
+# tree, so a concurrent push can never upload a half-written temp file.
+SYNC_TMP_DIR="${STATE_DIR}/tmp"
+# Written when the boot pull finishes (success or not). The push loop waits
+# for it before its first push, so it cannot overwrite our own namespace's
+# claude.json/history.jsonl before the boot pull has restored them. /run is
+# tmpfs, so it clears on reboot; 270_*.sh also removes it before each run.
+BOOT_DONE_MARKER="${RA_CLAUDE_SYNC_BOOT_DONE:-/run/ra-claude-sync.boot-pull.done}"
 # A local file modified this recently may be open in a live Claude Code
 # session; the tree merge never fast-forwards it.
 ACTIVE_WINDOW_SECONDS="${RA_CLAUDE_SYNC_ACTIVE_WINDOW_SECONDS:-120}"
@@ -251,7 +260,7 @@ merge_claude_json() {
 merge_tree() {
     local src="$1" dest="$2"
     [ -d "${src}" ] || return 0
-    mkdir -p "${dest}"
+    mkdir -p "${dest}" "${SYNC_TMP_DIR}"
     local now rec f rel d rsize lsize mtime sig tmp
     local copied=0 forwarded=0 kept=0
     local -A local_size=()
@@ -272,7 +281,9 @@ merge_tree() {
             continue
         fi
         [ "${rsize}" -gt "${lsize}" ] || continue
-        mtime="$(stat -c %Y -- "${d}")"
+        # Deleted since the bulk find? Skip it rather than letting set -e
+        # abort the whole pull.
+        mtime="$(stat -c %Y -- "${d}" 2>/dev/null)" || continue
         if [ $((now - mtime)) -lt "${ACTIVE_WINDOW_SECONDS}" ]; then
             log "skip-active ${rel}: modified locally $((now - mtime))s ago"
             kept=$((kept + 1))
@@ -280,7 +291,9 @@ merge_tree() {
         fi
         sig="$(file_sig "${d}")"
         if cmp -s -n "${lsize}" -- "${d}" "${f}"; then
-            tmp="${d}.ra-sync.$$"
+            # Temp lives outside the pushed tree (same filesystem, so the
+            # rename stays atomic) so a concurrent push never uploads it.
+            tmp="${SYNC_TMP_DIR}/ff.$$.${forwarded}.${kept}"
             if cp -- "${f}" "${tmp}" 2>>"${LOG_FILE}" \
                 && replace_if_unchanged "${d}" "${tmp}" "${sig}"; then
                 log "fast-forward ${rel} (${lsize} -> ${rsize} bytes)"
@@ -296,10 +309,12 @@ merge_tree() {
         fi
     done < <(find "${src}" -type f -printf '%s %P\0')
     # Copy every missing file in one no-clobber pass (new files are
-    # UUID-named, so nothing local is racing to create them). Ownership is
-    # fixed by the pull's final chown.
+    # UUID-named, so nothing local is racing to create them), then hand the
+    # tree to the user immediately: the pull runs as root, and a root-owned
+    # new project dir would stop Claude Code creating its session file there.
     if [ "${copied}" -gt 0 ]; then
         cp -rn --preserve=mode,timestamps -- "${src}/." "${dest}/" 2>>"${LOG_FILE}" || true
+        chown -R "${USER_NAME}:" "${dest}" 2>/dev/null || true
     fi
     log "merged ${src}: ${copied} new, ${forwarded} fast-forwarded, ${kept} kept local"
 }
@@ -321,10 +336,13 @@ cat > "${PULL_PATH}" <<'PULL_EOF'
 #                                   namespaces + history.jsonl only;
 #                                   output goes to the caller's stdout.
 #
-# Namespaces are mirrored incrementally into /var/cache/ra-claude-sync/
-# (ephemeral — the first pull after a restart is a full download), then
-# merged per file by merge_tree (common.sh). A lock keeps the boot pull and
-# a periodic pull from overlapping.
+# Namespaces are mirrored incrementally into ONE shared tree per subtree
+# under /var/cache/ra-claude-sync/mirror/ (ephemeral — the first pull after
+# a restart is a full download). Each namespace is rsynced over that tree and
+# merged (merge_tree, common.sh) before the next one is rsynced, so every
+# namespace's version of a file is considered, while files identical across
+# namespaces — most of them, since workstations re-push what they pull —
+# are downloaded and stored once. A lock keeps pulls from overlapping.
 set -euo pipefail
 
 LOG_TAG="claude-sync-pull"
@@ -338,6 +356,22 @@ if [ "${BOOT}" -eq 1 ]; then
     mkdir -p "$(dirname "${LOG_FILE}")"
     exec >> "${LOG_FILE}" 2>&1
 fi
+
+# On every exit path (including the early "nothing to pull" ones): hand
+# anything we created back to the user — we run as root, and a root-owned
+# ~/.claude would lock Claude Code out — and, for the boot pull, release
+# the push loop.
+finish() {
+    [ -d "${USER_HOME}/.claude" ] && chown -R "${USER_NAME}:" "${USER_HOME}/.claude" 2>/dev/null
+    [ -f "${USER_HOME}/.claude.json" ] && chown "${USER_NAME}:" "${USER_HOME}/.claude.json" 2>/dev/null
+    [ -d "${STATE_DIR}" ] && chown -R "${USER_NAME}:" "${STATE_DIR}" 2>/dev/null
+    if [ "${BOOT}" -eq 1 ]; then
+        mkdir -p "$(dirname "${BOOT_DONE_MARKER}")" 2>/dev/null
+        touch "${BOOT_DONE_MARKER}" 2>/dev/null
+    fi
+    return 0
+}
+trap finish EXIT
 
 [ -r /run/ra/env ] && set -a && . /run/ra/env && set +a
 
@@ -447,28 +481,29 @@ if [ "${#PULL_NS[@]}" -eq 0 ]; then
     exit 0
 fi
 
-# Mirror each selected namespace, then merge it into the live tree.
+# Rsync each selected namespace over the shared mirror, then merge it into
+# the live tree before the next namespace overwrites the mirror. Our own
+# namespace (boot only) is first in PULL_NS.
+SINGLE_DIR="${MIRROR_DIR}/.single"
+rm -rf "${SINGLE_DIR}"
+mkdir -p "${SINGLE_DIR}"
 history_srcs=()
 claudejson_srcs=()
 for ns in "${PULL_NS[@]}"; do
     ns_id="${ns%/}"; ns_id="${ns_id##*/}"
-    m="${MIRROR_DIR}/${ns_id}"
-    mkdir -p "${m}"
     for sub in projects todos plans session-env; do
-        mkdir -p "${m}/${sub}"
+        mkdir -p "${MIRROR_DIR}/${sub}"
         gcloud storage rsync --recursive \
-            "${ns}${sub}/" "${m}/${sub}/" 2>>"${LOG_FILE}" || true
-        merge_tree "${m}/${sub}" "${USER_HOME}/.claude/${sub}"
+            "${ns}${sub}/" "${MIRROR_DIR}/${sub}/" 2>>"${LOG_FILE}" || true
+        merge_tree "${MIRROR_DIR}/${sub}" "${USER_HOME}/.claude/${sub}"
     done
-    # Single-file members: one copy per namespace, folded in below. A
-    # failed fetch drops the stale mirror copy rather than re-merging it.
-    gcloud storage cp "${ns}history.jsonl" "${m}/history.jsonl" 2>>"${LOG_FILE}" \
-        || rm -f "${m}/history.jsonl"
-    history_srcs+=("${m}/history.jsonl")
-    if [ "${BOOT}" -eq 1 ]; then
-        gcloud storage cp "${ns}claude.json" "${m}/claude.json" 2>>"${LOG_FILE}" \
-            || rm -f "${m}/claude.json"
-        claudejson_srcs+=("${m}/claude.json")
+    # Single-file members: one small copy per namespace, folded in below.
+    if gcloud storage cp "${ns}history.jsonl" "${SINGLE_DIR}/${ns_id}.history.jsonl" 2>>"${LOG_FILE}"; then
+        history_srcs+=("${SINGLE_DIR}/${ns_id}.history.jsonl")
+    fi
+    if [ "${BOOT}" -eq 1 ] \
+        && gcloud storage cp "${ns}claude.json" "${SINGLE_DIR}/${ns_id}.claude.json" 2>>"${LOG_FILE}"; then
+        claudejson_srcs+=("${SINGLE_DIR}/${ns_id}.claude.json")
     fi
 done
 
@@ -480,25 +515,6 @@ if [ "${BOOT}" -eq 1 ]; then
     merge_claude_json "${USER_HOME}/.claude.json" "${claudejson_srcs[@]}"
 fi
 
-# Drop mirrors of namespaces that aged out of the selection so the cache
-# tracks the working set. Only at boot: a periodic pull deliberately skips
-# our own namespace, and must not throw away its mirror.
-if [ "${BOOT}" -eq 1 ]; then
-    for d in "${MIRROR_DIR}"/*/; do
-        [ -d "${d}" ] || continue
-        id="$(basename "${d}")"
-        keep=0
-        for ns in "${PULL_NS[@]}"; do
-            ns_id="${ns%/}"; ns_id="${ns_id##*/}"
-            [ "${ns_id}" = "${id}" ] && { keep=1; break; }
-        done
-        [ "${keep}" -eq 1 ] || rm -rf "${d}"
-    done
-fi
-
-chown -R "${USER_NAME}:" "${USER_HOME}/.claude" 2>/dev/null || true
-[ -f "${USER_HOME}/.claude.json" ] && chown "${USER_NAME}:" "${USER_HOME}/.claude.json" 2>/dev/null || true
-[ -d "${STATE_DIR}" ] && chown -R "${USER_NAME}:" "${STATE_DIR}" 2>/dev/null || true
 log "done (${mode})"
 PULL_EOF
 chmod 0755 "${PULL_PATH}"
@@ -507,6 +523,7 @@ chmod 0755 "${PULL_PATH}"
 # sequence: a multi-GB pull run inline once kept sshd from stabilizing
 # and Cloud Workstations tore the container down mid-boot. The pull
 # script logs to the log file itself under --boot.
+rm -f /run/ra-claude-sync.boot-pull.done
 if ! setsid --fork "${PULL_PATH}" --boot </dev/null >/dev/null 2>&1; then
     echo "[claude-sync-pull] WARNING: detached boot pull failed to start;" \
          "boot pull skipped this boot" >&2

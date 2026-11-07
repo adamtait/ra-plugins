@@ -65,8 +65,9 @@ cat > "${LOOP_PATH}" <<'LOOP_EOF'
 #     "freshest".
 #
 # Single-writer guard (ADR 0006): the manifest records which instance
-# wrote it. At startup, if a DIFFERENT instance pushed to our namespace
-# recently, the loop exits instead of overwriting that workstation's data.
+# wrote it. At startup, while a DIFFERENT instance has pushed to our
+# namespace recently, the loop waits instead of overwriting that
+# workstation's data, and takes the namespace over once it goes quiet.
 #
 # All gcloud chatter is appended to /var/log/ra-claude-sync.log. Exits
 # with status 1 on any unrecoverable startup error. Under systemd the
@@ -133,21 +134,39 @@ MANIFEST_PATH="gs://${BUCKET}/claude-sync/_manifest/${WS_ID}.json"
 
 # Single-writer guard. A manifest written by a different instance within
 # the last 3 push intervals means another live workstation owns this
-# namespace; pushing would overwrite its history.jsonl / claude.json.
-# A stale foreign manifest (e.g. the previous instance of a workstation
-# rebuilt under the same name) is fine — we take the namespace over.
-existing_manifest="$(gcloud storage cat "${MANIFEST_PATH}" 2>/dev/null || true)"
-if [ -n "${existing_manifest}" ] && [ -n "${WRITER_INSTANCE}" ]; then
-    other_instance="$(printf '%s' "${existing_manifest}" | jq -r '.writer_instance // empty' 2>/dev/null || true)"
-    other_epoch="$(printf '%s' "${existing_manifest}" | jq -r '.last_push_at_epoch // 0' 2>/dev/null || echo 0)"
+# namespace; pushing would overwrite its history.jsonl / claude.json. Wait
+# (re-checking every 3 intervals) rather than exit: under the setsid
+# fallback nothing would restart us, and a just-rebuilt workstation must be
+# able to take over its predecessor's namespace once that one goes quiet.
+collision_check() {
+    local manifest other_instance other_epoch age
+    [ -n "${WRITER_INSTANCE}" ] || return 0
+    manifest="$(gcloud storage cat "${MANIFEST_PATH}" 2>/dev/null || true)"
+    [ -n "${manifest}" ] || return 0
+    other_instance="$(printf '%s' "${manifest}" | jq -r '.writer_instance // empty' 2>/dev/null || true)"
+    other_epoch="$(printf '%s' "${manifest}" | jq -r '.last_push_at_epoch // 0' 2>/dev/null || echo 0)"
     case "${other_epoch}" in *[!0-9]*|"") other_epoch=0 ;; esac
     age=$(( $(date -u +%s) - other_epoch ))
     if [ -n "${other_instance}" ] && [ "${other_instance}" != "${WRITER_INSTANCE}" ] \
         && [ "${age}" -lt $(( 3 * INTERVAL )) ]; then
-        log "ERROR namespace collision: ${WS_ID} was pushed ${age}s ago by instance ${other_instance} (we are ${WRITER_INSTANCE}); refusing to push. See docs/adr/0006-per-workstation-namespace.md"
-        exit 1
+        log "ERROR namespace collision: ${WS_ID} was pushed ${age}s ago by instance ${other_instance} (we are ${WRITER_INSTANCE}); not pushing, re-checking in $(( 3 * INTERVAL ))s. See docs/adr/0006-per-workstation-namespace.md"
+        return 1
     fi
-fi
+    return 0
+}
+until collision_check; do
+    sleep $(( 3 * INTERVAL ))
+done
+
+# Wait for the boot pull to finish before the first push. It restores our
+# own namespace's claude.json / history.jsonl after a rebuild; pushing first
+# would overwrite them with this fresh workstation's near-empty copies.
+# Bounded so a boot pull that never started can't stall pushes forever.
+for _ in $(seq 1 180); do
+    [ -e "${BOOT_DONE_MARKER}" ] && break
+    sleep 5
+done
+[ -e "${BOOT_DONE_MARKER}" ] || log "WARN: boot pull not finished after 15min; starting pushes anyway"
 
 log "starting push loop ws-id=${WS_ID} interval=${INTERVAL}s pull_interval=${PULL_INTERVAL}s prefix=${PREFIX}"
 
@@ -215,14 +234,15 @@ push_once() {
     fi
 }
 
-# The boot pull (270_*.sh) ran moments ago, so the first periodic pull is
-# one full PULL_INTERVAL away.
+# The boot pull just finished, so the first periodic pull is one full
+# PULL_INTERVAL away. Pulls run in the background so a slow pull never
+# delays pushes; the pull's own flock stops two from overlapping.
 last_pull="$(date -u +%s)"
 while true; do
     push_once
     if [ "${PULL_INTERVAL}" -gt 0 ] && [ -x "${PULL_PATH}" ] \
         && [ $(( $(date -u +%s) - last_pull )) -ge "${PULL_INTERVAL}" ]; then
-        "${PULL_PATH}" || log "periodic pull exited $?"
+        "${PULL_PATH}" </dev/null &
         last_pull="$(date -u +%s)"
     fi
     sleep "${INTERVAL}"

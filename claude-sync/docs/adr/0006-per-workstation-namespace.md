@@ -32,18 +32,26 @@ can't differ per workstation. The result:
    and kept in `/home/user/.ra-claude-sync/ws-suffix`. With no stable id at all, the legacy
    `resolve_ws_id()` (instance name) is used as before.
 2. **Single-writer guard.** The manifest now carries `writer_host` and `writer_instance` (the GCE
-   instance name). At startup the push loop reads its own namespace's manifest. If a *different*
-   instance pushed within the last 3 push intervals, the loop logs `ERROR namespace collision` and
-   exits without pushing. A stale foreign writer, such as the previous instance of a rebuilt
-   workstation, is taken over silently.
+   instance name). At startup the push loop reads its own namespace's manifest. While a *different*
+   instance has pushed within the last 3 push intervals, the loop logs `ERROR namespace collision`
+   and waits, re-checking every 3 intervals, without pushing. It doesn't exit, because under the
+   `setsid` fallback nothing would restart it. Once the foreign writer goes quiet, for example the
+   previous instance of a rebuilt workstation, the loop takes the namespace over.
 3. **Pull as a reusable script, run at boot and periodically.** `270_*.sh` writes out
    `/usr/local/lib/ra-claude-sync/common.sh` (shared helpers, replacing the copy-in-two-places
    functions) and `/usr/local/bin/ra-claude-sync-pull.sh`, then runs the pull detached with `--boot`.
-   The push loop runs the same script every `pull_interval_seconds` (default 600; 0 disables it). A
-   `flock` stops two pulls from overlapping.
-4. **Incremental mirror.** Namespaces are mirrored into `/var/cache/ra-claude-sync/mirror/<ns>/`
-   with `gcloud storage rsync`, so repeat pulls only download changes. `/var` resets on restart, so
-   the first pull after boot is a full download, as before, and the home disk doesn't grow.
+   The push loop runs the same script in the background every `pull_interval_seconds` (default 600;
+   0 disables it), so a slow pull never delays pushes. A `flock` stops two pulls from overlapping.
+   The loop's first push waits (up to 15 minutes) for the boot pull to write
+   `/run/ra-claude-sync.boot-pull.done`. Otherwise it could overwrite our own namespace's
+   `claude.json` and `history.jsonl` before the boot pull restored them.
+4. **Incremental shared mirror.** There is one mirror tree per subtree under
+   `/var/cache/ra-claude-sync/mirror/`. Each selected namespace is rsynced over it and merged before
+   the next one is rsynced, so every namespace's version of a file is considered. Files identical
+   across namespaces, which is most of them because workstations re-push what they pull, are
+   downloaded and stored once. A per-namespace mirror would have cost N × the full history in disk
+   and bandwidth. `/var` resets on restart, so the first pull after boot is a full download, as
+   before, and the home disk doesn't grow.
 5. **Per-file merge rules** (`merge_tree`), replacing `cp -an`:
    - missing locally → copy in;
    - remote strictly larger, local is a byte prefix of it, and local is idle (not modified in the
@@ -57,7 +65,9 @@ can't differ per workstation. The result:
    (boot only) are written back only if the local file's size, inode and nanosecond mtime didn't
    change during the merge. `history.jsonl` retries up to 3 times. Temp files inherit the
    destination's owner and mode before the rename, so a file Claude Code appends to never becomes
-   root-owned.
+   root-owned. Fast-forward temp files live in `~/.ra-claude-sync/tmp`, which is on the same
+   filesystem but outside the pushed tree, so a concurrent push never uploads one. Newly copied
+   files are chowned right after the copy, and an EXIT trap chowns `~/.claude` on every exit path.
 7. **Our own namespace is merged at boot only.** It restores a rebuilt workstation's history.
    Periodically it would only re-download what we just pushed.
 
@@ -79,5 +89,11 @@ can't differ per workstation. The result:
   JSONL-aware merge, which is out of scope.
 - **A small race remains.** There are microseconds between the final unchanged-check and the
   `rename(2)`. Closing that would need Claude Code to cooperate on locking.
+- **Local deletions don't stick.** A file deleted locally is copied back from any namespace that
+  still has it, now within one pull interval rather than at the next boot. That includes this
+  workstation's own earlier pushes. Deletions never propagated in this design (ADR 0002). Fixing it
+  would need a record of files seen locally, or tombstones.
+- **Files that differ across namespaces are re-downloaded each pull.** The shared mirror flips
+  between each namespace's version of such a file, typically an active session.
 - **The guard depends on metadata.** Without a resolvable instance name the guard is skipped. That's
   the same fail-open stance as ADR 0002's `resolve_ws_id`.
