@@ -145,19 +145,14 @@ BUCKET="${RA_PLUGIN_CLAUDE_SYNC_BUCKET}"
 INTERVAL="${RA_PLUGIN_CLAUDE_SYNC_INTERVAL_SECONDS:-60}"
 case "${INTERVAL}" in *[!0-9]*|"") INTERVAL=60 ;; esac
 
-# Namespace selection (load-reduction plan #3). Prefer the stable
-# RA_PLUGIN_CLAUDE_SYNC_NAMESPACE injected by `ra create` so a rebuilt
-# workstation pushes to ONE namespace instead of a fresh UUID namespace
-# each create. Fall back to resolve_ws_id() (metadata / cached / hostname)
-# when unset. Keep this block in sync with the identical selection in
-# 270_*.sh. Metadata is up by now (we waited for /run/ra/env, well after
-# boot), so the fallback resolves authoritatively and caches the value.
-if [ -n "${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE:-}" ]; then
-    WS_ID="${RA_PLUGIN_CLAUDE_SYNC_NAMESPACE}"
-    log "using stable namespace from RA_PLUGIN_CLAUDE_SYNC_NAMESPACE=${WS_ID}"
-else
-    WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
-fi
+# Namespace = this workstation instance's own id, never a shared one
+# (docs/adr/0007-unique-workstation-identifiers.md). RA_PLUGIN_CLAUDE_SYNC_NAMESPACE
+# — the per-config id older `ra create` runs inject — is deliberately ignored:
+# every workstation on a config would share it and overwrite each other.
+# Keep this in sync with the identical selection in 270_*.sh. Metadata is up
+# by now (we waited for /run/ra/env, well after boot), so this resolves
+# authoritatively and caches the value.
+WS_ID="$(resolve_ws_id)" || log "WARN: metadata + cache both unavailable; using hostname=${WS_ID} (namespace may fork)"
 
 PREFIX="gs://${BUCKET}/claude-sync/workstations/${WS_ID}"
 MANIFEST_PATH="gs://${BUCKET}/claude-sync/_manifest/${WS_ID}.json"

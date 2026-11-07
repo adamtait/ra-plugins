@@ -1,7 +1,6 @@
 # 7. Workstation identifiers are unique and never reused
 
-- Status: accepted (2026-11-06). **Decision recorded; code not yet changed** — see
-  [Implementation status](#implementation-status).
+- Status: accepted (2026-11-06); implemented — see [Implementation status](#implementation-status).
 - Supersedes: [ADR 0004](./0004-load-reduction.md) #3 (stable per-user namespace) and
   [ADR 0006](./0006-rebuild-restore-and-merge-on-push.md) (whose implementation, PR #34, is reverted)
 - Applies to: `claude-sync` plugin
@@ -76,11 +75,20 @@ re-pushes what it pulled, history spreads transitively to every machine that com
 
 ## Implementation status
 
-The decision is accepted, but reverting PR #34 only returns the scripts to their pre-#34 state, which
-still prefers `RA_PLUGIN_CLAUDE_SYNC_NAMESPACE` (270 and 271) and `plugin.yaml` still declares
-`stable_id`. Until a follow-up lands, workstations on one config still share a namespace, and the
-overwrite incident above is not mitigated. The follow-up is small:
+Reverting PR #34 alone returned the scripts to a state that still preferred
+`RA_PLUGIN_CLAUDE_SYNC_NAMESPACE`, so the decision was not yet in force. It is now:
 
-- make `270_*.sh` and `271_*.sh` use `resolve_ws_id()` unconditionally, ignoring
+- `270_*.sh` and `271_*.sh` call `resolve_ws_id()` unconditionally and ignore
   `RA_PLUGIN_CLAUDE_SYNC_NAMESPACE`;
-- drop the `stable_id:` declaration from `plugin.yaml`, so `ra create` stops injecting the id.
+- `plugin.yaml` no longer declares `stable_id:`, so `ra create` stops injecting the id.
+
+Rollout:
+
+- **No config change is needed.** Workstation configs made by older `ra create` runs still carry
+  `RA_PLUGIN_CLAUDE_SYNC_NAMESPACE` in their container env. The scripts ignore it.
+- **First boot with this change:** each workstation starts pushing to a new namespace named after its
+  instance, and its first push uploads the whole `~/.claude` once.
+- **The old shared `<stable-id>` namespace** receives no more writes. It is pulled like any other
+  namespace while it is within `pull_max_age_days` and the count cap, then ages out under ADR 0004 #4.
+- **Nothing is recovered or migrated.** If two workstations were sharing a namespace, whatever each
+  overwrote of the other's `history.jsonl` / `claude.json` stays lost.
