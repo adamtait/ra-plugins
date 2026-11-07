@@ -19,6 +19,8 @@ Each ADR follows a lightweight *Context / Decision / Consequences* form.
   - [0001 — python3 local port helpers (macOS bash SIGABRT fix)](../../et/docs/adr/0001-python3-local-port-helpers.md)
 - **gcloud** — [`gcloud/docs/adr/`](../../gcloud/docs/adr/)
   - [0001 — gcloud auth-provider model](../../gcloud/docs/adr/0001-auth-provider-model.md)
+- **rust** — [`rust/docs/adr/`](../../rust/docs/adr/)
+  - [0001 — Runtime cargo-tool symlinks and a config-hash install marker](../../rust/docs/adr/0001-runtime-cargo-tool-symlinks-and-config-hash-marker.md)
 - **claude-sync** — [`claude-sync/docs/adr/`](../../claude-sync/docs/adr/)
   - [0001 — GCS-backed cross-workstation state sync](../../claude-sync/docs/adr/0001-gcs-state-sync-architecture.md)
   - [0002 — Merge-based sync for append-only / shared files](../../claude-sync/docs/adr/0002-merge-based-sync.md)

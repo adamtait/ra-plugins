@@ -1,0 +1,33 @@
+name: rust
+version: "1.0.0"
+description: "Installs the Rust toolchain via rustup (cargo, rustc, clippy, rustfmt), plus optional components, targets, and cargo tools"
+# post_install_message: printed by `ra plugin install`. rustup installs at first
+# boot into the persistent ~/.rustup and ~/.cargo; build-time symlinks put the
+# rustup proxies (cargo, rustc, ...) on PATH. Configured cargo tools are linked
+# into /usr/local/bin on every boot; anything you `cargo install` later lands in
+# ~/.cargo/bin, which is not on PATH by default (see docs/adr/0002).
+post_install_message: |
+  Rust installs on the workstation at first boot via rustup into ~/.rustup and
+  ~/.cargo; cargo, rustc, rustfmt, clippy, and the other rustup proxies are on
+  PATH. Tools listed in cargo_tools are installed with cargo-binstall and also
+  put on PATH. Anything you `cargo install` yourself later lands in ~/.cargo/bin,
+  which is not on PATH by default — add it in your shell dotfiles if you want it.
+  Update a floating channel (e.g. stable) with `rustup update`.
+config:
+  - name: enabled
+    type: bool
+    description: "Install the Rust toolchain?"
+    default: false
+  - name: toolchain
+    type: string
+    description: "Default toolchain: stable, beta, nightly, a version (1.84.0), or a dated nightly (nightly-2026-10-01)"
+    default: "stable"
+  - name: components
+    type: string_list
+    description: "Extra rustup components beyond the default profile (which has rustfmt and clippy), e.g. rust-analyzer, rust-src; enter one per prompt, empty line to finish"
+  - name: targets
+    type: string_list
+    description: "Extra compilation targets, e.g. wasm32-unknown-unknown, x86_64-unknown-linux-musl; enter one per prompt, empty line to finish"
+  - name: cargo_tools
+    type: string_list
+    description: "Cargo crates to install as tools (prebuilt via cargo-binstall where available), e.g. cargo-nextest, cargo-watch; enter one per prompt, empty line to finish"
