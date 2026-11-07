@@ -32,6 +32,10 @@ truncated. The union-merge model (ADR 0002) is unchanged; it just operates over 
 
 ### #3 — Stable per-user namespace (`ra create` + both scripts)
 
+> **Superseded by [ADR 0007](./0007-unique-workstation-identifiers.md).** The stable id is per
+> workstation *config*, so workstations on one config shared a namespace and overwrote each other.
+> #1 and #4 below still stand.
+
 `ra create` injects `RA_PLUGIN_CLAUDE_SYNC_NAMESPACE`, a deterministic id derived from
 `(gcloud project, workstation config name, git user email)` — lowercased, restricted to `[a-z0-9_-]`,
 slash-free, and suffixed with an 8-hex digest of the raw triple so distinct triples never collide.

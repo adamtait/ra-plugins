@@ -1,6 +1,8 @@
 # 6. Rebuild restore, merge-on-push, and shared-namespace safety
 
-- Status: accepted (2026-10-19)
+- Status: **superseded by [ADR 0007](./0007-unique-workstation-identifiers.md)** (2026-11-06). Was
+  accepted 2026-10-19; the implementation (PR #34) was reverted. Kept as a record of the incident
+  and of the shared-namespace approach that 0007 replaces.
 - Supersedes: ADR 0004 #1's "our own namespace is always skipped (push-only)", and ADR 0002's
   assumption that each namespace has exactly one writer
 - Applies to: `claude-sync` plugin (+ `soft_delete_days` in `ra` core)
