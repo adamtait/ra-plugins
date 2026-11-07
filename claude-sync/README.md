@@ -27,9 +27,11 @@ $ claude          # up-arrow replays A's prompts; A's transcripts, todos,
   hand a session off between machines, or review usage across all of them from one place.
 - **An allowlist, not a blob.** Exactly the six paths below are pushed each cycle; PIDs, caches, the
   npm plugin dir, and shell snapshots are excluded by design, so nothing machine-local leaks.
-- **No write contention.** Each workstation writes only to its own namespace prefix and the boot pull
+- **No write contention.** Each workstation writes only to its own namespace prefix and the pull
   *union-merges* every other namespace, so parallel machines never clobber each other's history.
-- **Bounded growth, logged — not silently capped.** The boot pull merges only namespaces pushed
+- **No reboot needed.** The pull runs at boot and again every `pull_interval_seconds` (default 10
+  minutes), so a session started on another workstation shows up here while you work.
+- **Bounded growth, logged — not silently capped.** The pull merges only namespaces pushed
   within `pull_max_age_days` and caps at the `pull_max_namespaces` most recent; GCS lifecycle rules
   demote data to Coldline at 90 days and delete at 365. Every exclusion is logged as `skip <ns>: <reason>`.
 
@@ -79,8 +81,9 @@ Workstation B ──┘     claude-sync/             └── Workstation D
 ```
 
 - Each workstation pushes only to `claude-sync/workstations/<ws-id>/` → no concurrent-write contention.
-- Boot pull merges every other namespace into `~/.claude/`: directory trees via `cp -an` (newer local
+- The pull merges every other namespace into `~/.claude/`: directory trees via `cp -an` (newer local
   files win), `history.jsonl` via union-merge, `.claude.json` via local-base + per-project history union.
+  The periodic pull does all of this except `.claude.json`, which only the boot pull touches.
 - `_manifest/<ws-id>.json` carries `last_push_at_epoch`, advanced only on a fully successful push cycle,
   and drives the boot pull's recency ranking.
 
@@ -94,6 +97,7 @@ Workstation B ──┘     claude-sync/             └── Workstation D
 | `sync_all_projects`    | bool   | `false`                     | User-level install only. Points every project's workstations at one shared bucket. |
 | `pull_max_age_days`    | int    | `30`                        | Boot pull merges only namespaces pushed within N days. `0` = cap-only. |
 | `pull_max_namespaces`  | int    | `15`                        | Boot pull caps the merge to the N most-recently-pushed namespaces.    |
+| `pull_interval_seconds`| int    | `600`                       | Seconds between periodic pulls. `0` = boot pull only. Same age/cap filter. |
 
 ## Operations
 
@@ -134,6 +138,9 @@ results, pasted content — and flow verbatim into the GCS bucket.
 ## Caveats
 
 - Up to `interval_seconds` of state can be lost if a workstation is killed between push cycles.
+- The periodic pull brings in *new* sessions. A transcript that already exists locally is never
+  updated (`cp -an`), so a session you continue on another machine stays at the older copy here.
+  A transcript you deleted locally can reappear within one `pull_interval_seconds`.
 - `gcloud storage rsync` re-uploads whole files on any byte change — a 50 MB session JSONL re-uploads
   fully each cycle. v2 plans a delta-append approach.
 - Parallel `CLAUDE.md` memory edits on two workstations resolve by last-merge-order on pull; no

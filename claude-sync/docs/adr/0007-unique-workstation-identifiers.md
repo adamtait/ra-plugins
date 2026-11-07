@@ -63,10 +63,10 @@ re-pushes what it pulled, history spreads transitively to every machine that com
   its last push is within `pull_max_age_days` (default 30) and it ranks in the top `pull_max_namespaces`
   (default 15). A rebuild after a longer gap restores nothing from it unless `pull_max_age_days` is raised.
   The data remains in the bucket until the 365-day Delete rule.
-- **Arrival is boot-only.** The pull runs once per boot. A running workstation does not see sessions that
-  another machine started or continued until its next boot. An existing local transcript is never
-  updated (`cp -an`), so a session continued elsewhere stays at the older local copy. A periodic pull
-  would address this; it is a separate decision and is not made here.
+- **Arrival is limited.** The pull runs at boot, and every `pull_interval_seconds` after that
+  ([ADR 0008](./0008-periodic-pull.md)), so a running workstation sees a session another machine
+  started within about that interval. An existing local transcript is never updated (`cp -an`), so a
+  session continued elsewhere stays at the older local copy.
 - **Duplicate storage** is unchanged: a workstation re-pushes the sessions it pulled, so an active session
   exists once per workstation that has seen it.
 - **The ADR 0006 operator tooling and tests are gone with the revert** (`claude-sync pull|push|status`,
