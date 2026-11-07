@@ -10,3 +10,4 @@ Decisions specific to the `claude-sync` plugin. See the
 - [0005 — Bucket naming, shared-bucket prefixing, and cross-project sync](./0005-bucket-naming-and-namespacing.md)
 - [0006 — Rebuild restore, merge-on-push, and shared-namespace safety](./0006-rebuild-restore-and-merge-on-push.md) *(superseded by 0007)*
 - [0007 — Workstation identifiers are unique and never reused](./0007-unique-workstation-identifiers.md)
+- [0008 — Periodic pull](./0008-periodic-pull.md)
