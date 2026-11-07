@@ -1,0 +1,10 @@
+#!/bin/bash
+# Fake jq for tests/run.sh: fails the slurp-mode merge (`jq -s`) when
+# FAKE_JQ_FAIL_SLURP=1, simulating a merge that dies (OOM, killed);
+# otherwise defers to the real jq further down PATH.
+if [ "${FAKE_JQ_FAIL_SLURP:-0}" = 1 ]; then
+    for a in "$@"; do [ "${a}" = -s ] && exit 5; done
+fi
+self="$(cd "$(dirname "$0")" && pwd)"
+PATH="$(printf '%s' "${PATH}" | tr ':' '\n' | grep -vx "${self}" | paste -sd:)"
+exec jq "$@"

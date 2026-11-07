@@ -1,5 +1,5 @@
 name: claude-sync
-version: "1.1.0"
+version: "1.2.0"
 description: "Syncs ~/.claude/ (session history, .claude.json, CLAUDE.md memory) across cloud workstations via a GCS bucket"
 # Bucket declared in plugin.yaml; ra provisions it generically by walking
 # every installed plugin's `buckets:` declaration (no plugin-specific code
@@ -11,6 +11,13 @@ buckets:
     override_field: bucket_name_override
     role: roles/storage.objectAdmin
     env_var: RA_PLUGIN_CLAUDE_SYNC_BUCKET
+    # Recovery net (ADR 0006). GCS soft delete keeps every overwritten or
+    # deleted object restorable for N days (`gcloud storage restore`).
+    # Declared explicitly so the guarantee doesn't depend on GCS defaults;
+    # ra core applies it on `ra create`, taking the max across plugins that
+    # share the bucket. Chosen over object versioning, which would retain a
+    # second copy of every per-cycle re-upload on top of soft delete.
+    soft_delete_days: 7
     # Storage hygiene (load-reduction plan #4). ra core applies these GCS
     # Object Lifecycle Management rules to the bucket on every `ra create`
     # (idempotent — GCS replaces the whole lifecycle config each time).

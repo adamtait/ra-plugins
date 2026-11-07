@@ -1,0 +1,14 @@
+#!/bin/bash
+# Fake curl for tests/run.sh: answers the GCE metadata instance-name query
+# with ${FAKE_INSTANCE_NAME}; fails (like an unreachable metadata server)
+# when it is unset. Never touches the network.
+for a in "$@"; do
+    case "${a}" in
+        *computeMetadata/v1/instance/name)
+            [ -n "${FAKE_INSTANCE_NAME:-}" ] || exit 7
+            printf '%s' "${FAKE_INSTANCE_NAME}"
+            exit 0
+            ;;
+    esac
+done
+exit 7
